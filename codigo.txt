@@ -1,0 +1,84 @@
+import pandas as pd
+
+# === Carregar base inicial (exemplo de leitura, ajuste conforme o seu arquivo)
+# df = pd.read_excel('sua_base.xlsx')
+
+df = pd.DataFrame()  # Criação de um dataframe vazio para exemplo
+
+# === Colunas existentes (na ordem mencionada)
+colunas_existentes = [
+    'Orgão Regulador', 'Tipo', 'Número', 'Data do Normativo', 'Ementa', 'Situação do documento',
+    'Data de início de vigência', 'Data de inclusão no MKCompliance', 'Segmentação', 'Aplicável a Instituição',
+    'Áreas afetadas', 'Diretorias Afetadas', 'Status da aplicação', 'Impacto', 'Status do Envio', 'Enviado por',
+    'Data de Envio', 'Prazo de Avaliação', 'Enviado para', 'Enviado para Área', 'Diretoria',
+    'Data de Resposta', 'Comentário', 'Escrito por', 'Escrito para', 'Área demandada', 'Diretoria demandada',
+    'Situação', 'Requer plano de ação', 'Gestor Responsavel', 'Plano de ação', 'Impacto Regulatório'
+]
+
+# Adicionar colunas extras que sempre existirão
+colunas_extras = ['QA', 'DataEntradaNorma', 'StatusNorma', 'DataReferencia']
+
+# Formato das novas colunas
+formato_colunas_extras = {
+    'QA': 'string',
+    'DataEntradaNorma': 'datetime64[ns]',
+    'StatusNorma': 'string',
+    'DataReferencia': 'datetime64[ns]'
+}
+
+# === Função para criar estrutura de cobrança ===
+def gerar_colunas_cobranca(tipo: str):
+    colunas_cobranca = []
+    if tipo == 'vigente':
+        for i in range(1, 4):
+            colunas_cobranca.append(f'{i}-cobranca')
+            colunas_cobranca.append(f'{i}-data-cobranca')
+        colunas_cobranca += ['acima-3-cobrancas', 'ultima-data-cobranca']
+    elif tipo == 'nao_vigente':
+        for i in range(1, 13):
+            colunas_cobranca.append(f'{i}-cobranca')
+            colunas_cobranca.append(f'{i}-data-cobranca')
+        colunas_cobranca += ['acima-12-cobrancas', 'ultima-data-cobranca']
+    return colunas_cobranca
+
+# === Função principal para criar as duas bases ===
+def criar_bases_cobranca(df_inicial):
+    # Verifica se as colunas obrigatórias existem
+    for coluna in colunas_existentes:
+        if coluna not in df_inicial.columns:
+            df_inicial[coluna] = pd.NA
+
+    # Adiciona colunas extras
+    for coluna, tipo in formato_colunas_extras.items():
+        if tipo == 'string':
+            df_inicial[coluna] = pd.Series(dtype='string')
+        elif tipo == 'datetime64[ns]':
+            df_inicial[coluna] = pd.Series(dtype='datetime64[ns]')
+
+    # Criar DataFrames separados
+    df_vigente = df_inicial.copy()
+    df_nao_vigente = df_inicial.copy()
+
+    # Adicionar colunas específicas de cobrança
+    for coluna in gerar_colunas_cobranca('vigente'):
+        if 'data' in coluna:
+            df_vigente[coluna] = pd.NaT
+        else:
+            df_vigente[coluna] = pd.Series(dtype='string')
+
+    for coluna in gerar_colunas_cobranca('nao_vigente'):
+        if 'data' in coluna:
+            df_nao_vigente[coluna] = pd.NaT
+        else:
+            df_nao_vigente[coluna] = pd.Series(dtype='string')
+
+    return df_vigente, df_nao_vigente
+
+# === Criar as bases
+base_vigente, base_nao_vigente = criar_bases_cobranca(df)
+
+# === Exemplo de salvar os arquivos
+# base_vigente.to_excel('base_vigente.xlsx', index=False)
+# base_nao_vigente.to_excel('base_nao_vigente.xlsx', index=False)
+
+# AQUI você pode preencher manualmente ou programaticamente os campos: QA, DataEntradaNorma, StatusNorma, DataReferencia
