@@ -1,84 +1,206 @@
-import pandas as pd
+import re 
+from pathlib import Path
+import os 
+import pandas as pd 
+import sys # Importante para flush output
 
-# === Carregar base inicial (exemplo de leitura, ajuste conforme o seu arquivo)
-# df = pd.read_excel('sua_base.xlsx')
+from playwright.sync_api import Playwright, sync_playwright, expect
 
-df = pd.DataFrame()  # Criação de um dataframe vazio para exemplo
+# --- Funções de Logging para Knime ---
+def knime_log(message: str):
+  """Escreve uma mensagem no console do Knime e garante o flush."""
+  print(message)
+  sys.stdout.flush()
 
-# === Colunas existentes (na ordem mencionada)
-colunas_existentes = [
-    'Orgão Regulador', 'Tipo', 'Número', 'Data do Normativo', 'Ementa', 'Situação do documento',
-    'Data de início de vigência', 'Data de inclusão no MKCompliance', 'Segmentação', 'Aplicável a Instituição',
-    'Áreas afetadas', 'Diretorias Afetadas', 'Status da aplicação', 'Impacto', 'Status do Envio', 'Enviado por',
-    'Data de Envio', 'Prazo de Avaliação', 'Enviado para', 'Enviado para Área', 'Diretoria',
-    'Data de Resposta', 'Comentário', 'Escrito por', 'Escrito para', 'Área demandada', 'Diretoria demandada',
-    'Situação', 'Requer plano de ação', 'Gestor Responsavel', 'Plano de ação', 'Impacto Regulatório'
-]
+def knime_error(message: str):
+  """Escreve uma mensagem de erro no console do Knime e garante o flush."""
+  print(f"ERROR: {message}")
+  sys.stderr.flush() # Erros geralmente vão para stderr
 
-# Adicionar colunas extras que sempre existirão
-colunas_extras = ['QA', 'DataEntradaNorma', 'StatusNorma', 'DataReferencia']
+# --- Configurações (Ajustadas para Knime) ---
+PROFILE_DIR = Path("N:/DCGV/Compliance/Compliance RO Varejo/Analytics/Projetos/AgendaNormativa/edge_profile/edge_profile").resolve()
+DOWNLOAD_DIR = Path("N:/DCGV/Compliance/Compliance RO Varejo/Analytics/Projetos/AgendaNormativa/base_mk").resolve()
 
-# Formato das novas colunas
-formato_colunas_extras = {
-    'QA': 'string',
-    'DataEntradaNorma': 'datetime64[ns]',
-    'StatusNorma': 'string',
-    'DataReferencia': 'datetime64[ns]'
-}
+# --- ATUALIZAÇÃO IMPORTANTE PARA O NOVO CAMINHO ---
+# A URL de login agora apontará para a página de compliance
+LOGIN_INIT_URL_2 = "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth?response_type=code&client_id=alfresco&redirect_uri=https://bv.mkcompliance.com.br/mk/compliance.html"
+# A URL base da aplicação após o login será a página de compliance
+TARGET_APP_URL_BASE_2 = "https://bv.mkcompliance.com.br/mk/compliance.html"
+FINAL_DESTINATION_URL_2 = None 
 
-# === Função para criar estrutura de cobrança ===
-def gerar_colunas_cobranca(tipo: str):
-    colunas_cobranca = []
-    if tipo == 'vigente':
-        for i in range(1, 4):
-            colunas_cobranca.append(f'{i}-cobranca')
-            colunas_cobranca.append(f'{i}-data-cobranca')
-        colunas_cobranca += ['acima-3-cobrancas', 'ultima-data-cobranca']
-    elif tipo == 'nao_vigente':
-        for i in range(1, 13):
-            colunas_cobranca.append(f'{i}-cobranca')
-            colunas_cobranca.append(f'{i}-data-cobranca')
-        colunas_cobranca += ['acima-12-cobrancas', 'ultima-data-cobranca']
-    return colunas_cobranca
+LOGIN_SERVICE_AUTH_URL_BASE = "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
 
-# === Função principal para criar as duas bases ===
-def criar_bases_cobranca(df_inicial):
-    # Verifica se as colunas obrigatórias existem
-    for coluna in colunas_existentes:
-        if coluna not in df_inicial.columns:
-            df_inicial[coluna] = pd.NA
+NEW_FILE_NAME = "pontosfocaisMK.xlsx" 
+GLOBAL_TIMEOUT_MS = 90000
 
-    # Adiciona colunas extras
-    for coluna, tipo in formato_colunas_extras.items():
-        if tipo == 'string':
-            df_inicial[coluna] = pd.Series(dtype='string')
-        elif tipo == 'datetime64[ns]':
-            df_inicial[coluna] = pd.Series(dtype='datetime64[ns]')
+def run_mapeamento_2(playwright: Playwright) -> pd.DataFrame:
+  """
+  Realiza o login, navega para a gestão de usuários através do novo caminho,
+  baixa e importa a base 'pontosfocaisMK' com cabeçalho a partir da linha 3,
+  otimizado para Knime.
+  """
+  PROFILE_DIR.mkdir(parents=True, exist_ok=True) 
+  DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True) 
 
-    # Criar DataFrames separados
-    df_vigente = df_inicial.copy()
-    df_nao_vigente = df_inicial.copy()
+  knime_log("--- Início da execução do Mapeamento 2 (Knime) ---") 
+  knime_log(f"Iniciando navegador com perfil: {PROFILE_DIR}")
 
-    # Adicionar colunas específicas de cobrança
-    for coluna in gerar_colunas_cobranca('vigente'):
-        if 'data' in coluna:
-            df_vigente[coluna] = pd.NaT
+  ctx = None 
+  page = None
+
+  df_excel = pd.DataFrame() 
+
+  try:
+    ctx = playwright.chromium.launch_persistent_context(
+      user_data_dir=PROFILE_DIR,
+      channel="msedge",   
+      headless=False,
+      timeout=GLOBAL_TIMEOUT_MS 
+    )
+    page = ctx.new_page()
+
+    knime_log(f"Mapeamento 2: Navegando para a URL de início do login: {LOGIN_INIT_URL_2}")
+    page.goto(LOGIN_INIT_URL_2, wait_until="domcontentloaded", timeout=GLOBAL_TIMEOUT_MS)
+
+    current_url = page.url
+    knime_log(f"Após o goto({LOGIN_INIT_URL_2}), URL inicial atual: {current_url}")
+
+    if current_url.startswith(LOGIN_SERVICE_AUTH_URL_BASE):
+      knime_log("Página de autenticação (SSO) detectada.")
+      try:
+        knime_log("Verificando se o botão 'MKCompliance Iniciar sua sess' é necessário...")
+        try:
+          mk_compliance_button = page.get_by_text("MKCompliance Iniciar sua sess")
+          expect(mk_compliance_button).to_be_visible(timeout=5000) 
+          knime_log("Botão 'MKCompliance Iniciar sua sess' encontrado. Clicando...")
+          mk_compliance_button.click()
+          page.wait_for_timeout(1000) # <- Apenas se quiser a pausa aqui
+        except Exception:
+          knime_log("Botão 'MKCompliance Iniciar sua sess' não encontrado/não necessário. Prosseguindo.")
+
+        knime_log("Tentando clicar no botão 'Microsoft' para login...")
+        microsoft_button = page.get_by_role("link", name="Microsoft")
+        expect(microsoft_button).to_be_visible(timeout=GLOBAL_TIMEOUT_MS) 
+         
+        knime_log("Clicando no botão 'Microsoft'...")
+        microsoft_button.click()
+
+        knime_log(f"Aguardando redirecionamento para a base da aplicação após SSO: {TARGET_APP_URL_BASE_2}...")
+        page.wait_for_url(TARGET_APP_URL_BASE_2 + "**", timeout=GLOBAL_TIMEOUT_MS) 
+        knime_log("Autenticação inicial concluída. Página base da aplicação (compliance.html) alcançada.")
+      except Exception as e:
+        knime_error(f"Erro durante o fluxo de autenticação (Microsoft SSO): {e}")
+        knime_log("Verifique se seu perfil do Edge está logado ou se foi necessária interação manual.")
+        if page:
+          page.screenshot(path=DOWNLOAD_DIR / "erro_login_mapeamento_2.png") 
+          knime_log(f"Screenshot do erro de login salva em: {DOWNLOAD_DIR / 'erro_login_mapeamento_2.png'}")
         else:
-            df_vigente[coluna] = pd.Series(dtype='string')
+          knime_log("Página não disponível para screenshot no momento do erro de login.")
+        ctx.close()
+        return df_excel 
+    else:
+      knime_log("Fluxo de login parece ter sido bypassado ou já logado. Prosseguindo...")
 
-    for coluna in gerar_colunas_cobranca('nao_vigente'):
-        if 'data' in coluna:
-            df_nao_vigente[coluna] = pd.NaT
-        else:
-            df_nao_vigente[coluna] = pd.Series(dtype='string')
+    page.wait_for_function("() => document.readyState === 'complete'", timeout=GLOBAL_TIMEOUT_MS)
+    knime_log("document.readyState é 'complete' na aplicação base (compliance.html).")
 
-    return df_vigente, df_nao_vigente
+    # --- INÍCIO DA NOVA NAVEGAÇÃO INTERNA ---
+    
+    knime_log("Clicando no botão 'Vinicius' para expandir opções do usuário.")
+    locator_vinicius = page.get_by_role("button", name="Vinicius")
+    expect(locator_vinicius).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+    locator_vinicius.click()
+    page.wait_for_timeout(2000) # << NOVO: Atraso de 2 segundos após clicar em 'Vinicius'
 
-# === Criar as bases
-base_vigente, base_nao_vigente = criar_bases_cobranca(df)
+    knime_log("Clicando no link 'Configurações'.")
+    locator_configuracoes = page.get_by_role("link", name=" Configurações")
+    expect(locator_configuracoes).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+    locator_configuracoes.click()
+    page.wait_for_timeout(1000) # <- Mantido em 1 segundo aqui, pode ajustar se necessário
 
-# === Exemplo de salvar os arquivos
-# base_vigente.to_excel('base_vigente.xlsx', index=False)
-# base_nao_vigente.to_excel('base_nao_vigente.xlsx', index=False)
+    knime_log("Aguardando visibilidade de 'Gestão de Usuários Permite' na página de Configurações.")
+    locator_gestao_usuarios = page.get_by_text("Gestão de Usuários Permite")
+    expect(locator_gestao_usuarios).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+    
+    knime_log("Clicando em 'Gestão de Usuários Permite' para acessar a base de usuários.")
+    locator_gestao_usuarios.click()
+    page.wait_for_timeout(2000) # << NOVO: Atraso de 2 segundos após clicar em 'Gestão de Usuários Permite'
+    
+    knime_log(f"URL atual após navegação interna para Gestão de Usuários: {page.url}")
+    knime_log("Continuando com as ações na página de Gestão de Usuários (download)...")
+    # --- FIM DA NOVA NAVEGAÇÃO INTERNA ---
 
-# AQUI você pode preencher manualmente ou programaticamente os campos: QA, DataEntradaNorma, StatusNorma, DataReferencia
+    knime_log("Aguardando o botão 'Excel' na página de Gestão de Usuários para download.")
+    expect(page.get_by_role("button", name="Excel")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+    knime_log("Botão 'Excel' encontrado.")
+
+    knime_log("Iniciando o download do arquivo Excel...")
+    with page.expect_download(timeout=GLOBAL_TIMEOUT_MS) as download_info: 
+      page.get_by_role("button", name="Excel").click()
+    download = download_info.value
+    knime_log("Download iniciado.")
+
+    file_name = NEW_FILE_NAME 
+    save_path = DOWNLOAD_DIR / file_name
+     
+    knime_log(f"Salvando arquivo Excel em: {save_path}")
+    download.save_as(save_path) 
+    knime_log("Arquivo Excel salvo com sucesso.")
+
+    # --- IMPORTAR PARA DATAFRAME E DELETAR ---
+    if os.path.exists(save_path): 
+      knime_log(f"Importando {file_name} para DataFrame...")
+      try:
+        df_excel = pd.read_excel(save_path, header=1) 
+        knime_log("Arquivo importado para DataFrame com sucesso!")
+        knime_log(f"DataFrame possui {df_excel.shape[0]} linhas e {df_excel.shape[1]} colunas.")
+
+        try:
+          knime_log(f"Deletando arquivo físico: {save_path}")
+          os.remove(save_path)
+          knime_log("Arquivo físico deletado com sucesso.")
+        except OSError as delete_error:
+          knime_error(f"AVISO: Não foi possível deletar o arquivo {save_path}: {delete_error}")
+          knime_log("Verifique permissões ou se o arquivo está em uso por outro processo.")
+
+      except Exception as read_e:
+        knime_error(f"Erro ao importar arquivo Excel para DataFrame: {read_e}")
+        knime_log("Verifique se o arquivo está corrompido ou o formato é suportado.")
+        knime_log("O arquivo não foi deletado, permaneceu em: {save_path}")
+    else:
+      knime_error(f"Erro: O arquivo {save_path} não foi encontrado após o download. Não pode ser importado.")
+
+  except Exception as general_error:
+    knime_error(f"***** ERRO GERAL DURANTE A EXECUÇÃO DO MAPEAMENTO 2 *****")
+    knime_error(f"Mensagem de erro: {general_error}")
+    if page:
+      page.screenshot(path=DOWNLOAD_DIR / "erro_automacao_mapeamento_2.png") 
+      knime_log(f"Screenshot do erro salva em: {DOWNLOAD_DIR / 'erro_automacao_mapeamento_2.png'}")
+      knime_log(f"URL atual no momento do erro: {page.url if page else 'N/A'}")
+    else:
+      knime_log("Página não disponível para screenshot no momento do erro.")
+  finally:
+    knime_log("\nFechando navegador e contexto do Mapeamento 2...")
+    if ctx: 
+      ctx.close() 
+    knime_log("Execução do Mapeamento 2 finalizada. ---")
+  
+  return df_excel 
+
+# --- A parte que interage com o Knime ---
+final_df_mapeamento_2 = pd.DataFrame() 
+
+try: 
+  with sync_playwright() as playwright:
+    final_df_mapeamento_2 = run_mapeamento_2(playwright) 
+     
+  if isinstance(final_df_mapeamento_2, pd.DataFrame) and not final_df_mapeamento_2.empty:
+    knime_log("\n!!! Processo do Mapeamento 2 concluído e DataFrame final obtido com sucesso. !!!")
+    output_table = final_df_mapeamento_2 
+  else:
+    knime_log("\n--- Não foi possível obter o DataFrame final do Mapeamento 2 ou ele está vazio. ---")
+    output_table = pd.DataFrame() 
+
+except Exception as knime_exec_error:
+  knime_error(f"Erro na execução principal do script Knime: {knime_exec_error}")
+  output_table = pd.DataFrame()
