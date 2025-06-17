@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-MKCompliance – baixa Excel
-• Usa o perfil real do Edge (sem InPrivate)
-• Seleciona "Exibindo todas as linhas" antes do download
-• Faz até 3 tentativas, valida 7 colunas mínimas
-• Compacta .xlsx em .zip e limpa pasta temporária
-
-Atualizado: 17-06-2025
+MKCompliance • Edge • Exporta para CSV
+• Abre perfil real do Edge (Default)
+• Seleciona "Exibindo todas as linhas"
+• Baixa Excel, converte para CSV, importa em DataFrame
+17-06-2025
 """
 
-import os, sys, time, shutil, zipfile
+import os, sys, time, shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -25,17 +23,24 @@ def kerr(msg): sys.stderr.write("ERROR: " + msg + "\n"); sys.stderr.flush()
 # ------------------------------------------------------------------
 # Caminhos
 # ------------------------------------------------------------------
-USER_DOCS  = Path(os.environ["USERPROFILE"]) / "Documents"
-RUN_ROOT   = USER_DOCS / "mk"
-RUN_ROOT.mkdir(exist_ok=True)
+USER_DOCS = Path(os.environ["USERPROFILE"]) / "Documents"
+RUN_DIR   = USER_DOCS / "mk_download"          # pasta temporária única
+RUN_DIR.mkdir(exist_ok=True)
 
 EDGE_PROFILE = (
     Path(os.environ["LOCALAPPDATA"])
     / "Microsoft" / "Edge" / "User Data" / "Default"
 )
 
+# Arquivos
+ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+xlsx_name = f"pontosfocaisMK_{ts}.xlsx"
+csv_name  = f"pontosfocaisMK_{ts}.csv"
+xlsx_path = RUN_DIR / xlsx_name
+csv_path  = RUN_DIR / csv_name
+
 # ------------------------------------------------------------------
-# URLs
+# URLs e timeouts
 # ------------------------------------------------------------------
 LOGIN_INIT_URL = (
     "https://bv.mkcompliance.com.br/auth/realms/alfresco/"
@@ -47,35 +52,24 @@ LOGIN_BASE = (
     "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
 )
 
-TIMEOUT_MS      = 90_000          # geral
-TIMEOUT_SHOWALL = 6_000           # passo "Exibindo todas as linhas"
-MIN_COLS = ["login", "Nome", "Sobrenome", "E-mail",
-            "Telefone", "Departamento", "Área"]
+TIMEOUT_MS      = 90_000   # geral
+TIMEOUT_SHOWALL = 6_000    # Exibindo todas as linhas
 
 # ------------------------------------------------------------------
-# Função de uma tentativa
+# Execução única
 # ------------------------------------------------------------------
-def do_attempt(pw, attempt_dir: Path, n: int) -> pd.DataFrame:
-    file_name = "pontosfocaisMK.xlsx"
-    xlsx_path = attempt_dir / file_name
-    zip_path  = attempt_dir / (file_name + ".zip")
-
-    ctx = page = None
-    df  = pd.DataFrame()
-
-    klog(f"Attempt {n} - {attempt_dir}")
+with sync_playwright() as pw:
+    ctx = pw.chromium.launch_persistent_context(
+        user_data_dir=str(EDGE_PROFILE),
+        channel="msedge",
+        headless=False,
+        timeout=TIMEOUT_MS,
+        args=["--profile-directory=Default"],
+    )
+    page = ctx.new_page()
 
     try:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=str(EDGE_PROFILE),
-            channel="msedge",
-            headless=False,
-            timeout=TIMEOUT_MS,
-            args=["--profile-directory=Default"],
-        )
-        page = ctx.new_page()
-
-        # 1) Login (SSO se necessário)
+        # 1) Login SSO se necessário
         page.goto(LOGIN_INIT_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
         if page.url.startswith(LOGIN_BASE):
             klog("SSO - clicando Microsoft")
@@ -83,7 +77,7 @@ def do_attempt(pw, attempt_dir: Path, n: int) -> pd.DataFrame:
             page.get_by_role("link", name="Microsoft").click()
             page.wait_for_url("https://bv.mkcompliance.com.br/mk/compliance.html**", timeout=TIMEOUT_MS)
 
-        # 2) Navegação até Gestão de Usuários
+        # 2) Gestão de Usuários
         page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
         expect(page.get_by_text("Gestão de Usuários Permite")).to_be_visible(timeout=TIMEOUT_MS)
         page.get_by_text("Gestão de Usuários Permite").click()
@@ -94,11 +88,11 @@ def do_attempt(pw, attempt_dir: Path, n: int) -> pd.DataFrame:
         expect(area_header).to_be_visible(timeout=TIMEOUT_MS)
         page.wait_for_timeout(500)
 
-        # 3) Seleciona "Exibindo todas as linhas"
+        # 3) Exibir todas as linhas
         klog("Selecionando 'Exibindo todas as linhas'")
-        select_label = page.get_by_label("Exibindo", exact=False)  # label parcial
+        select_label = page.get_by_label("Exibindo", exact=False)
         expect(select_label).to_be_visible(timeout=TIMEOUT_SHOWALL)
-        select_label.select_option("-1")           # -1 = todas as linhas
+        select_label.select_option("-1")
         page.wait_for_timeout(500)
 
         # 4) Download Excel
@@ -106,7 +100,7 @@ def do_attempt(pw, attempt_dir: Path, n: int) -> pd.DataFrame:
             page.get_by_role("button", name="Excel").click()
         dl = dl_info.value
         dl.save_as(xlsx_path)
-        klog(f"Salvo em {xlsx_path}")
+        klog(f"Excel salvo em {xlsx_path}")
 
         # aguarda estabilizar
         last = -1
@@ -115,68 +109,33 @@ def do_attempt(pw, attempt_dir: Path, n: int) -> pd.DataFrame:
             if sz == last: break
             last = sz; time.sleep(0.4)
 
-        # 5) Ler e logar colunas
-        df = pd.read_excel(xlsx_path, header=1, dtype=str)
-        klog(f"Colunas ({len(df.columns)}): {list(df.columns)}")
-
-        # 6) Validação
-        if not all(c in df.columns for c in MIN_COLS):
-            kerr("Colunas mínimas faltando")
-            df = pd.DataFrame()
-        else:
-            klog("Colunas OK")
-
-        # 7) Compacta e remove .xlsx
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(xlsx_path, arcname=file_name)
-        os.remove(xlsx_path)
-        klog("Compactado e .xlsx removido")
-
-    except Exception as e:
-        kerr(f"Falha attempt {n}: {e}")
-        df = pd.DataFrame()
     finally:
-        if ctx: ctx.close()
-
-    return df
+        ctx.close()
 
 # ------------------------------------------------------------------
-# Pipeline (até 3 tentativas)
+# 5) Converter para CSV e carregar
 # ------------------------------------------------------------------
-def run_pipeline() -> pd.DataFrame:
-    final_df = pd.DataFrame()
+klog("Convertendo para CSV…")
+df_excel = pd.read_excel(xlsx_path, header=1, dtype=str)   # cabeçalho na linha 2
+df_excel.to_csv(csv_path, index=False, encoding="utf-8")
+klog(f"CSV salvo em {csv_path}")
 
-    with sync_playwright() as pw:
-        for n in range(1, 4):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            attempt_dir = RUN_ROOT / f"{ts}_try{n}"
-            attempt_dir.mkdir(parents=True, exist_ok=True)
-
-            df = do_attempt(pw, attempt_dir, n)
-
-            shutil.rmtree(attempt_dir, ignore_errors=True)
-
-            if not df.empty:
-                klog(f"Concluído na tentativa {n}")
-                final_df = df
-                break
-
-            klog(f"Tentativa {n} falhou, aguardando 5 s\n")
-            time.sleep(5)
-
-    # remove mk se vazia
-    try:
-        if not any(RUN_ROOT.iterdir()):
-            RUN_ROOT.rmdir()
-    except Exception:
-        pass
-
-    if final_df.empty:
-        kerr("Todas as 3 tentativas falharam")
-
-    return final_df
+# DataFrame carregado do CSV (opcional, mas atende 'importação no código')
+df_csv = pd.read_csv(csv_path, dtype=str)
 
 # ------------------------------------------------------------------
-# Execução (KNIME)
+# Limpeza da pasta (opcional)
 # ------------------------------------------------------------------
-output_table = run_pipeline()
+try:
+    os.remove(xlsx_path)
+except Exception: pass
+
+# Se quiser remover o CSV também depois de usá-lo, descomente:
+# try: os.remove(csv_path)
+# except Exception: pass
+
+# ------------------------------------------------------------------
+# Saída para KNIME
+# ------------------------------------------------------------------
+output_table = df_csv
+klog("Processo concluído.")
