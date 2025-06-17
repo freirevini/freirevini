@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Automação MK Compliance – versão com:
-1) download em pasta temporária     (C:\Temp\mk_downloads)
-2) nome único com timestamp
-3) logs de tamanho de arquivo + colunas
-4) validação das colunas obrigatórias
+Automação MK Compliance – versão 17-Jun-2025
+Ajustes:
+• Vai direto para /mk/admin.html#/cfghome depois do SSO
+• Remove cliques em "Vinicius"
+• Header Excel começa na linha 2 (pandas header=1)
+• Usa só C:\Temp\mk_downloads
+• Valida colunas obrigatórias
 """
 
 import os
-import re
 import sys
 import time
 import shutil
@@ -20,167 +21,165 @@ from playwright.sync_api import Playwright, sync_playwright, expect
 
 
 # ----------------------------------------------------------------------
-# Funções auxiliares de log para o console do KNIME
+# Funções de log (compatíveis com KNIME)
 # ----------------------------------------------------------------------
-def knime_log(msg: str):
+def klog(msg: str):
     print(msg)
     sys.stdout.flush()
 
 
-def knime_error(msg: str):
+def kerr(msg: str):
     print(f"ERROR: {msg}")
     sys.stderr.flush()
 
 
 # ----------------------------------------------------------------------
-# Configurações globais
+# Caminhos
 # ----------------------------------------------------------------------
-PROFILE_DIR = Path(r"N:/DCGV/Compliance/Compliance RO Varejo/Analytics/Projetos/AgendaNormativa/edge_profile/edge_profile").resolve()
-DOWNLOAD_DIR = Path(r"C:/Users/vinicius.silva/Documents/bases/mk").resolve()
+PROFILE_DIR = Path(
+    r"N:/DCGV/Compliance/Compliance RO Varejo/Analytics/Projetos/AgendaNormativa/edge_profile/edge_profile"
+).resolve()
 
-# Diretório temporário *fora* de Documents (reduz bloqueio do Indexer/AV)
-TEMP_DIR = Path(r"C:/Temp/mk_downloads").resolve()
+TEMP_DIR = Path(r"C:/Temp/mk_downloads").resolve()   # único diretório usado
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-LOGIN_INIT_URL_2 = (
+# ----------------------------------------------------------------------
+# URLs relevantes
+# ----------------------------------------------------------------------
+LOGIN_INIT_URL = (
     "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
     "?response_type=code&client_id=alfresco"
     "&redirect_uri=https://bv.mkcompliance.com.br/mk/compliance.html"
 )
-TARGET_APP_URL_BASE_2 = "https://bv.mkcompliance.com.br/mk/compliance.html"
-LOGIN_SERVICE_AUTH_URL_BASE = "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
 
-GLOBAL_TIMEOUT_MS = 90_000
-REQUIRED_COLUMNS = [
+ADMIN_URL = "https://bv.mkcompliance.com.br/mk/admin.html#/cfghome"
+LOGIN_SERVICE_BASE = (
+    "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
+)
+
+# ----------------------------------------------------------------------
+# Configurações gerais
+# ----------------------------------------------------------------------
+TIMEOUT_MS = 90_000
+REQUIRED_COLS = [
     "login", "Nome", "Sobrenome", "E-mail", "Telefone",
-    "Departamento", "Área", "Perfil", "Segmento"
+    "Departamento", "Área", "Perfil", "Segmento",
 ]
 
 
 # ----------------------------------------------------------------------
 # Função principal de automação
 # ----------------------------------------------------------------------
-def run_mapeamento_2(playwright: Playwright) -> pd.DataFrame:
-    """Faz login, baixa planilha Excel e devolve DataFrame validado."""
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    knime_log("--- Início da execução Mapeamento 2 ---")
-
+def run(playwright: Playwright) -> pd.DataFrame:
+    """Abre o navegador, faz o SSO, baixa o Excel e devolve DataFrame validado."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_name = f"pontosfocaisMK_{timestamp}.xlsx"
-    temp_path = TEMP_DIR / file_name           # download chega aqui
-    final_path = DOWNLOAD_DIR / file_name      # arquivo é movido para cá
+    file_path = TEMP_DIR / file_name
 
-    ctx = None
-    page = None
-    df_excel = pd.DataFrame()
+    df = pd.DataFrame()
+    ctx = page = None
 
     try:
         ctx = playwright.chromium.launch_persistent_context(
             user_data_dir=PROFILE_DIR,
             channel="msedge",
             headless=False,
-            timeout=GLOBAL_TIMEOUT_MS,
+            timeout=TIMEOUT_MS,
         )
         page = ctx.new_page()
 
-        # --- Login / SSO ---------------------------------------------------
-        knime_log(f"Navegando para URL de login: {LOGIN_INIT_URL_2}")
-        page.goto(LOGIN_INIT_URL_2, wait_until="domcontentloaded", timeout=GLOBAL_TIMEOUT_MS)
+        # ------------------------------------------------------------------
+        # 1. Login / SSO
+        # ------------------------------------------------------------------
+        klog(f"Abrindo URL de login: {LOGIN_INIT_URL}")
+        page.goto(LOGIN_INIT_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
 
-        if page.url.startswith(LOGIN_SERVICE_AUTH_URL_BASE):
-            # botão "Microsoft"
-            knime_log("Fluxo SSO detectado. Clicando em 'Microsoft'...")
-            expect(page.get_by_role("link", name="Microsoft")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+        if page.url.startswith(LOGIN_SERVICE_BASE):
+            klog("SSO necessário – clicando em 'Microsoft'.")
+            expect(page.get_by_role("link", name="Microsoft")).to_be_visible(timeout=TIMEOUT_MS)
             page.get_by_role("link", name="Microsoft").click()
-            knime_log("Aguardando redirecionamento pós-login…")
-            page.wait_for_url(TARGET_APP_URL_BASE_2 + "**", timeout=GLOBAL_TIMEOUT_MS)
+            page.wait_for_url("https://bv.mkcompliance.com.br/mk/compliance.html**", timeout=TIMEOUT_MS)
         else:
-            knime_log("Sessão já autenticada, pulando SSO.")
+            klog("Sessão já autenticada – pulando SSO.")
 
-        # --- Navegação interna até o botão Excel --------------------------
-        page.wait_for_function("() => document.readyState === 'complete'", timeout=GLOBAL_TIMEOUT_MS)
-        expect(page.get_by_role("button", name="Vinicius")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
-        page.get_by_role("button", name="Vinicius").click()
-        time.sleep(2)
+        # ------------------------------------------------------------------
+        # 2. Vai direto para admin.html#/cfghome
+        # ------------------------------------------------------------------
+        klog(f"Navegando para {ADMIN_URL}")
+        page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
 
-        expect(page.get_by_role("link", name=" Configurações")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
-        page.get_by_role("link", name=" Configurações").click()
-        time.sleep(1)
-
-        expect(page.get_by_text("Gestão de Usuários Permite")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+        # Aguarda o link/elemento “Gestão de Usuários Permite” nessa página
+        expect(page.get_by_text("Gestão de Usuários Permite")).to_be_visible(timeout=TIMEOUT_MS)
         page.get_by_text("Gestão de Usuários Permite").click()
-        time.sleep(2)
+        time.sleep(2)   # pequena pausa para UI carregar
 
-        # --- Download ------------------------------------------------------
-        expect(page.get_by_role("button", name="Excel")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
-        knime_log("Iniciando download do Excel…")
-        with page.expect_download(timeout=GLOBAL_TIMEOUT_MS) as download_info:
+        # ------------------------------------------------------------------
+        # 3. Download do Excel
+        # ------------------------------------------------------------------
+        expect(page.get_by_role("button", name="Excel")).to_be_visible(timeout=TIMEOUT_MS)
+        klog("Iniciando download do Excel…")
+        with page.expect_download(timeout=TIMEOUT_MS) as dl_info:
             page.get_by_role("button", name="Excel").click()
-        download = download_info.value
-        download.save_as(temp_path)
-        knime_log(f"Arquivo baixado em (temporário): {temp_path}")
 
-        # Aguarda tamanho estabilizar (proteção contra lock)
-        last_size = -1
+        download = dl_info.value
+        download.save_as(file_path)
+        klog(f"Arquivo salvo em: {file_path}")
+
+        # Aguarda tamanho estabilizar (proteção contra lock/antivírus)
+        last = -1
         while True:
-            size = os.path.getsize(temp_path)
-            if size == last_size:
+            sz = os.path.getsize(file_path)
+            if sz == last:
                 break
-            last_size = size
+            last = sz
             time.sleep(0.5)
 
-        # Move para pasta definitiva
-        shutil.move(temp_path, final_path)
-        knime_log(f"Arquivo movido para: {final_path}")
+        # ------------------------------------------------------------------
+        # 4. Leitura e validação
+        # ------------------------------------------------------------------
+        df = pd.read_excel(file_path, header=1, dtype=str)   # linha 2 zero-index = 1
+        klog(f"Tamanho do arquivo: {os.path.getsize(file_path):,} bytes")
+        klog(f"Colunas importadas ({len(df.columns)}): {list(df.columns)}")
 
-        # --- Importa e valida ---------------------------------------------
-        df_excel = pd.read_excel(final_path, header=2, dtype=str)  # header=2 = linha 3 (zero-index)
-        file_size = os.path.getsize(final_path)
-        knime_log(f"Tamanho do arquivo salvo: {file_size:,} bytes")
-        knime_log(f"Colunas importadas ({len(df_excel.columns)}): {list(df_excel.columns)}")
-
-        # Validação das colunas
-        if not all(col in df_excel.columns for col in REQUIRED_COLUMNS):
-            knime_error("Arquivo não contém todas as colunas obrigatórias. Importação cancelada.")
-            df_excel = pd.DataFrame()             # devolve vazio
+        if not all(col in df.columns for col in REQUIRED_COLS):
+            kerr("Colunas obrigatórias faltando – descartando DataFrame.")
+            df = pd.DataFrame()
         else:
-            knime_log("✔ Todas as colunas obrigatórias presentes.")
+            klog("✔ Todas as colunas obrigatórias presentes.")
 
-        # Limpeza opcional do arquivo físico
+        # ------------------------------------------------------------------
+        # 5. Limpeza (opcional)
+        # ------------------------------------------------------------------
         try:
-            os.remove(final_path)
-            knime_log("Arquivo físico deletado após importação.")
+            os.remove(file_path)
+            klog("Arquivo físico deletado após importação.")
         except OSError as e:
-            knime_error(f"Não foi possível deletar {final_path}: {e}")
+            kerr(f"Não foi possível apagar {file_path}: {e}")
 
     except Exception as e:
-        knime_error(f"ERRO GERAL: {e}")
+        kerr(f"Falha geral: {e}")
         if page:
-            page.screenshot(path=DOWNLOAD_DIR / "erro_automacao.png")
+            page.screenshot(path=TEMP_DIR / "erro_automacao.png")
     finally:
         if ctx:
             ctx.close()
-        knime_log("--- Fim da execução Mapeamento 2 ---")
 
-    return df_excel
+    return df
 
 
 # ----------------------------------------------------------------------
-# Execução dentro do KNIME
+# Execução (p/ nó Python do KNIME)
 # ----------------------------------------------------------------------
 output_table = pd.DataFrame()
 
 try:
     with sync_playwright() as pw:
-        output_table = run_mapeamento_2(pw)
+        output_table = run(pw)
 
     if output_table.empty:
-        knime_error("Processo concluído, mas DataFrame está vazio.")
+        kerr("Processo terminou mas DataFrame está vazio.")
     else:
-        knime_log("Processo concluído com sucesso e DataFrame carregado.")
-
+        klog("Processo concluído com sucesso e DataFrame carregado.")
 except Exception as e:
-    knime_error(f"Erro na execução principal: {e}")
+    kerr(f"Erro na execução principal: {e}")
     output_table = pd.DataFrame()
