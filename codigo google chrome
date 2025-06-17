@@ -1,0 +1,179 @@
+# -*- coding: utf-8 -*-
+"""
+MKCompliance – download via Google Chrome
+• Usa perfil real do Chrome (Default)
+• Seleciona "Exibindo todas as linhas" antes do download
+• Até 3 tentativas, valida 7 colunas, compacta .xlsx
+
+Atualizado: 17-06-2025
+"""
+
+import os, sys, time, shutil, zipfile
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from playwright.sync_api import sync_playwright, expect
+
+# ------------------------------------------------------------------
+# Funções de log (ASCII)
+# ------------------------------------------------------------------
+def klog(msg): sys.stdout.write(msg + "\n"); sys.stdout.flush()
+def kerr(msg): sys.stderr.write("ERROR: " + msg + "\n"); sys.stderr.flush()
+
+# ------------------------------------------------------------------
+# Pastas
+# ------------------------------------------------------------------
+USER_DOCS = Path(os.environ["USERPROFILE"]) / "Documents"
+RUN_ROOT  = USER_DOCS / "mk"
+RUN_ROOT.mkdir(exist_ok=True)
+
+CHROME_PROFILE = (
+    Path(os.environ["LOCALAPPDATA"])
+    / "Google" / "Chrome" / "User Data" / "Default"
+)
+
+# ------------------------------------------------------------------
+# URLs
+# ------------------------------------------------------------------
+LOGIN_INIT_URL = (
+    "https://bv.mkcompliance.com.br/auth/realms/alfresco/"
+    "protocol/openid-connect/auth?response_type=code&client_id=alfresco"
+    "&redirect_uri=https://bv.mkcompliance.com.br/mk/compliance.html"
+)
+ADMIN_URL  = "https://bv.mkcompliance.com.br/mk/admin.html#/cfghome"
+LOGIN_BASE = (
+    "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
+)
+
+TIMEOUT_MS      = 90_000
+TIMEOUT_SHOWALL = 6_000
+MIN_COLS = ["login", "Nome", "Sobrenome", "E-mail",
+            "Telefone", "Departamento", "Área"]
+
+# ------------------------------------------------------------------
+# Uma tentativa
+# ------------------------------------------------------------------
+def do_attempt(pw, attempt_dir: Path, n: int) -> pd.DataFrame:
+    file_name = "pontosfocaisMK.xlsx"
+    xlsx_path = attempt_dir / file_name
+    zip_path  = attempt_dir / (file_name + ".zip")
+
+    ctx = page = None
+    df  = pd.DataFrame()
+
+    klog(f"Attempt {n} - {attempt_dir}")
+
+    try:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(CHROME_PROFILE),
+            channel="chrome",                 # <-- Google Chrome
+            headless=False,
+            timeout=TIMEOUT_MS,
+            args=["--profile-directory=Default"],
+        )
+        page = ctx.new_page()
+
+        # 1) Login SSO se necessário
+        page.goto(LOGIN_INIT_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+        if page.url.startswith(LOGIN_BASE):
+            klog("SSO - clicando Microsoft")
+            expect(page.get_by_role("link", name="Microsoft")).to_be_visible(timeout=TIMEOUT_MS)
+            page.get_by_role("link", name="Microsoft").click()
+            page.wait_for_url("https://bv.mkcompliance.com.br/mk/compliance.html**", timeout=TIMEOUT_MS)
+
+        # 2) Gestão de Usuários
+        page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+        expect(page.get_by_text("Gestão de Usuários Permite")).to_be_visible(timeout=TIMEOUT_MS)
+        page.get_by_text("Gestão de Usuários Permite").click()
+
+        # Espera coluna Área
+        klog("Esperando cabecalho 'Área'")
+        area_header = page.locator("th", has_text="Área").first
+        expect(area_header).to_be_visible(timeout=TIMEOUT_MS)
+        page.wait_for_timeout(500)
+
+        # 3) Exibir todas as linhas
+        klog("Selecionando 'Exibindo todas as linhas'")
+        select_label = page.get_by_label("Exibindo", exact=False)
+        expect(select_label).to_be_visible(timeout=TIMEOUT_SHOWALL)
+        select_label.select_option("-1")
+        page.wait_for_timeout(500)
+
+        # 4) Download
+        with page.expect_download(timeout=TIMEOUT_MS) as dl_info:
+            page.get_by_role("button", name="Excel").click()
+        dl = dl_info.value
+        dl.save_as(xlsx_path)
+        klog(f"Salvo em {xlsx_path}")
+
+        # aguarda estabilizar
+        last = -1
+        while True:
+            sz = os.path.getsize(xlsx_path)
+            if sz == last: break
+            last = sz; time.sleep(0.4)
+
+        # 5) Ler e validar
+        df = pd.read_excel(xlsx_path, header=1, dtype=str)
+        klog(f"Colunas ({len(df.columns)}): {list(df.columns)}")
+
+        if not all(c in df.columns for c in MIN_COLS):
+            kerr("Colunas mínimas faltando")
+            df = pd.DataFrame()
+        else:
+            klog("Colunas OK")
+
+        # 6) Compacta
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(xlsx_path, arcname=file_name)
+        os.remove(xlsx_path)
+        klog("Compactado e .xlsx removido")
+
+    except Exception as e:
+        kerr(f"Falha attempt {n}: {e}")
+        df = pd.DataFrame()
+    finally:
+        if ctx: ctx.close()
+
+    return df
+
+# ------------------------------------------------------------------
+# Pipeline (até 3 tentativas)
+# ------------------------------------------------------------------
+def run_pipeline() -> pd.DataFrame:
+    final_df = pd.DataFrame()
+
+    with sync_playwright() as pw:
+        for n in range(1, 4):
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            attempt_dir = RUN_ROOT / f"{ts}_try{n}"
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+
+            df = do_attempt(pw, attempt_dir, n)
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+
+            if not df.empty:
+                klog(f"Concluído na tentativa {n}")
+                final_df = df
+                break
+
+            klog(f"Tentativa {n} falhou, aguardando 5 s\n")
+            time.sleep(5)
+
+    # remove mk se vazia
+    try:
+        if not any(RUN_ROOT.iterdir()):
+            RUN_ROOT.rmdir()
+    except Exception:
+        pass
+
+    if final_df.empty:
+        kerr("Todas as 3 tentativas falharam")
+
+    return final_df
+
+# ------------------------------------------------------------------
+# Execução (KNIME)
+# ------------------------------------------------------------------
+output_table = run_pipeline()
