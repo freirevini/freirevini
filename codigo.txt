@@ -19,7 +19,7 @@ def knime_error(message: str):
 
 # --- Configurações (Ajustadas para Knime) ---
 PROFILE_DIR = Path("N:/DCGV/Compliance/Compliance RO Varejo/Analytics/Projetos/AgendaNormativa/edge_profile/edge_profile").resolve()
-DOWNLOAD_DIR = Path("N:/DCGV/Compliance/Compliance RO Varejo/Analytics/Projetos/AgendaNormativa/base_mk").resolve()
+DOWNLOAD_DIR = Path("C:/Users/vinicius.silva/Documents/bases/mk").resolve()
 
 # --- ATUALIZAÇÃO IMPORTANTE PARA O NOVO CAMINHO ---
 # A URL de login agora apontará para a página de compliance
