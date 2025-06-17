@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-MKCompliance – Download com 3 tentativas, compactação e validação
-17-Jun-2025
+MKCompliance – Download com tentativas, validacao e compactacao
+Atualizado: 17-06-2025
 """
 
 import os, sys, time, shutil, zipfile
@@ -11,29 +11,26 @@ from pathlib import Path
 import pandas as pd
 from playwright.sync_api import sync_playwright, expect
 
-
-# ----------------------------------------------------------------------
-# Utilidades de log (compatíveis com nó Python do KNIME)
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Funcoes de log (ASCII only)
+# ------------------------------------------------------------------
 def klog(msg: str):
-    print(msg)
+    sys.stdout.write(msg + "\n")
     sys.stdout.flush()
 
-
 def kerr(msg: str):
-    print(f"ERROR: {msg}")
+    sys.stderr.write("ERROR: " + msg + "\n")
     sys.stderr.flush()
 
-
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------------
 # Pastas e URLs
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------------
 PROFILE_DIR = Path(
     r"N:/DCGV/Compliance/Compliance RO Varejo/Analytics/Projetos/AgendaNormativa/edge_profile/edge_profile"
 ).resolve()
 
-ROOT_RUN_DIR = Path(r"C:\Temp\mk_runs").resolve()     # raiz p/ subdiretórios
-ROOT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+RUN_ROOT = Path(r"C:\Temp\mk_runs").resolve()
+RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 LOGIN_INIT_URL = (
     "https://bv.mkcompliance.com.br/auth/realms/alfresco/"
@@ -41,34 +38,28 @@ LOGIN_INIT_URL = (
     "&redirect_uri=https://bv.mkcompliance.com.br/mk/compliance.html"
 )
 ADMIN_URL = "https://bv.mkcompliance.com.br/mk/admin.html#/cfghome"
-LOGIN_SERVICE_BASE = (
+LOGIN_BASE = (
     "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
 )
 
 TIMEOUT_MS = 90_000
-REQUIRED = [
+MIN_COLS = [
     "login", "Nome", "Sobrenome", "E-mail",
     "Telefone", "Departamento", "Área",
 ]
 
-
-# ----------------------------------------------------------------------
-# Função que faz **uma** tentativa
-# ----------------------------------------------------------------------
-def do_attempt(play, run_dir: Path, attempt: int) -> pd.DataFrame:
-    """
-    Faz uma tentativa de baixar e validar a planilha.
-    Retorna DataFrame vazio se falhar.
-    """
-    file_name = f"pontosfocaisMK.xlsx"
-    raw_path = run_dir / file_name            # onde o .xlsx é salvo
-    zip_path = run_dir / (file_name + ".zip")
+# ------------------------------------------------------------------
+# Uma tentativa de download / leitura
+# ------------------------------------------------------------------
+def do_attempt(play, attempt_dir: Path, attempt_n: int) -> pd.DataFrame:
+    file_name = "pontosfocaisMK.xlsx"
+    xlsx_path = attempt_dir / file_name
+    zip_path = attempt_dir / (file_name + ".zip")
 
     ctx = page = None
     df = pd.DataFrame()
 
-    timestamp_tag = run_dir.name
-    klog(f"➜ Tentativa {attempt} – subpasta {timestamp_tag}")
+    klog("Attempt %d - directory %s" % (attempt_n, attempt_dir.name))
 
     try:
         ctx = play.chromium.launch_persistent_context(
@@ -79,59 +70,59 @@ def do_attempt(play, run_dir: Path, attempt: int) -> pd.DataFrame:
         )
         page = ctx.new_page()
 
-        # 1. Login (SSO se necessário)
+        # 1) Login se necessario
         page.goto(LOGIN_INIT_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-        if page.url.startswith(LOGIN_SERVICE_BASE):
-            klog("SSO necessário – clicando em 'Microsoft'…")
+        if page.url.startswith(LOGIN_BASE):
+            klog("SSO - clicando em Microsoft")
             expect(page.get_by_role("link", name="Microsoft")).to_be_visible(timeout=TIMEOUT_MS)
             page.get_by_role("link", name="Microsoft").click()
             page.wait_for_url("https://bv.mkcompliance.com.br/mk/compliance.html**", timeout=TIMEOUT_MS)
 
-        # 2. Vá direto ao admin e abra Gestão de Usuários
+        # 2) Navega direto para admin
         page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
         expect(page.get_by_text("Gestão de Usuários Permite")).to_be_visible(timeout=TIMEOUT_MS)
         page.get_by_text("Gestão de Usuários Permite").click()
 
-        # 3. Espere a coluna 'Área' aparecer
-        klog("Aguardando a grade carregar (coluna 'Área')…")
+        # 3) Espera a grade carregar (cabecalho 'Área')
+        klog("Esperando cabecalho 'Área' aparecer")
         expect(page.locator("th", has_text="Área")).to_be_visible(timeout=TIMEOUT_MS)
         page.wait_for_timeout(500)
 
-        # 4. Download
+        # 4) Download
         with page.expect_download(timeout=TIMEOUT_MS) as dl_info:
             page.get_by_role("button", name="Excel").click()
         dl = dl_info.value
-        dl.save_as(raw_path)
-        klog(f"Arquivo salvo: {raw_path}")
+        dl.save_as(xlsx_path)
+        klog("Arquivo salvo em %s" % xlsx_path)
 
-        # espera tamanho estabilizar
+        # aguarda estabilizar
         last = -1
         while True:
-            size_now = os.path.getsize(raw_path)
-            if size_now == last:
-                break
-            last = size_now
+            sz = os.path.getsize(xlsx_path)
             time.sleep(0.4)
+            if sz == last:
+                break
+            last = sz
 
-        # 5. Lê para DataFrame
-        df = pd.read_excel(raw_path, header=1, dtype=str)
-        klog(f"Colunas importadas ({len(df.columns)}): {list(df.columns)}")
+        # 5) Leitura
+        df = pd.read_excel(xlsx_path, header=1, dtype=str)
+        klog("Colunas importadas: %s" % list(df.columns))
 
-        # 6. Validação
-        if not all(col in df.columns for col in REQUIRED):
-            kerr("↪ Colunas mínimas faltando – tentativa considerada falha.")
+        # 6) Validacao
+        if not all(c in df.columns for c in MIN_COLS):
+            kerr("Colunas minimas faltando")
             df = pd.DataFrame()
         else:
-            klog("✔ Colunas mínimas OK – tentativa considerada SUCESSO.")
+            klog("Colunas minimas OK")
 
-        # 7. Compacta antes de copiar
+        # 7) Compacta e remove xlsx
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(raw_path, arcname=file_name)
-        os.remove(raw_path)       # remove .xlsx “nu”
-        klog(f"Arquivo compactado em {zip_path.name} e original excluído.")
+            zf.write(xlsx_path, arcname=file_name)
+        os.remove(xlsx_path)
+        klog("Compactado em %s e .xlsx removido" % zip_path.name)
 
     except Exception as e:
-        kerr(f"Falha na tentativa {attempt}: {e}")
+        kerr("Falha tentativa %d: %s" % (attempt_n, e))
         df = pd.DataFrame()
     finally:
         if ctx:
@@ -139,30 +130,28 @@ def do_attempt(play, run_dir: Path, attempt: int) -> pd.DataFrame:
 
     return df
 
-
-# ----------------------------------------------------------------------
-# Função principal – até 3 tentativas
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Pipeline com ate 3 tentativas
+# ------------------------------------------------------------------
 def run_pipeline() -> pd.DataFrame:
-    with sync_playwright() as p:
-        for attempt in range(1, 4):
-            run_dir = ROOT_RUN_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_try{attempt}"
-            run_dir.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as pw:
+        for n in range(1, 4):
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            att_dir = RUN_ROOT / ("%s_try%d" % (ts, n))
+            att_dir.mkdir(parents=True, exist_ok=True)
 
-            df = do_attempt(p, run_dir, attempt)
+            df = do_attempt(pw, att_dir, n)
             if not df.empty:
-                klog(f"✓ Processo concluído na tentativa {attempt}.")
+                klog("Processo concluido na tentativa %d" % n)
                 return df
 
-            klog("Aguardando 5 s antes da próxima tentativa…\n")
+            klog("Tentativa %d falhou, aguardando 5 s\n" % n)
             time.sleep(5)
 
-        # se chegou aqui, todas falharam
-        kerr("✖ Todas as 3 tentativas falharam – devolvendo DataFrame vazio.")
+        kerr("Todas as 3 tentativas falharam")
         return pd.DataFrame()
 
-
-# ----------------------------------------------------------------------
-# Execução (KNIME)
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Execucao para o KNIME
+# ------------------------------------------------------------------
 output_table = run_pipeline()
