@@ -102,4 +102,85 @@ def run_mapeamento_2(playwright: Playwright) -> pd.DataFrame:
         # --- Navegação interna até o botão Excel --------------------------
         page.wait_for_function("() => document.readyState === 'complete'", timeout=GLOBAL_TIMEOUT_MS)
         expect(page.get_by_role("button", name="Vinicius")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
-        page.get_b_
+        page.get_by_role("button", name="Vinicius").click()
+        time.sleep(2)
+
+        expect(page.get_by_role("link", name=" Configurações")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+        page.get_by_role("link", name=" Configurações").click()
+        time.sleep(1)
+
+        expect(page.get_by_text("Gestão de Usuários Permite")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+        page.get_by_text("Gestão de Usuários Permite").click()
+        time.sleep(2)
+
+        # --- Download ------------------------------------------------------
+        expect(page.get_by_role("button", name="Excel")).to_be_visible(timeout=GLOBAL_TIMEOUT_MS)
+        knime_log("Iniciando download do Excel…")
+        with page.expect_download(timeout=GLOBAL_TIMEOUT_MS) as download_info:
+            page.get_by_role("button", name="Excel").click()
+        download = download_info.value
+        download.save_as(temp_path)
+        knime_log(f"Arquivo baixado em (temporário): {temp_path}")
+
+        # Aguarda tamanho estabilizar (proteção contra lock)
+        last_size = -1
+        while True:
+            size = os.path.getsize(temp_path)
+            if size == last_size:
+                break
+            last_size = size
+            time.sleep(0.5)
+
+        # Move para pasta definitiva
+        shutil.move(temp_path, final_path)
+        knime_log(f"Arquivo movido para: {final_path}")
+
+        # --- Importa e valida ---------------------------------------------
+        df_excel = pd.read_excel(final_path, header=2, dtype=str)  # header=2 = linha 3 (zero-index)
+        file_size = os.path.getsize(final_path)
+        knime_log(f"Tamanho do arquivo salvo: {file_size:,} bytes")
+        knime_log(f"Colunas importadas ({len(df_excel.columns)}): {list(df_excel.columns)}")
+
+        # Validação das colunas
+        if not all(col in df_excel.columns for col in REQUIRED_COLUMNS):
+            knime_error("Arquivo não contém todas as colunas obrigatórias. Importação cancelada.")
+            df_excel = pd.DataFrame()             # devolve vazio
+        else:
+            knime_log("✔ Todas as colunas obrigatórias presentes.")
+
+        # Limpeza opcional do arquivo físico
+        try:
+            os.remove(final_path)
+            knime_log("Arquivo físico deletado após importação.")
+        except OSError as e:
+            knime_error(f"Não foi possível deletar {final_path}: {e}")
+
+    except Exception as e:
+        knime_error(f"ERRO GERAL: {e}")
+        if page:
+            page.screenshot(path=DOWNLOAD_DIR / "erro_automacao.png")
+    finally:
+        if ctx:
+            ctx.close()
+        knime_log("--- Fim da execução Mapeamento 2 ---")
+
+    return df_excel
+
+
+# ----------------------------------------------------------------------
+# Execução dentro do KNIME
+# ----------------------------------------------------------------------
+output_table = pd.DataFrame()
+
+try:
+    with sync_playwright() as pw:
+        output_table = run_mapeamento_2(pw)
+
+    if output_table.empty:
+        knime_error("Processo concluído, mas DataFrame está vazio.")
+    else:
+        knime_log("Processo concluído com sucesso e DataFrame carregado.")
+
+except Exception as e:
+    knime_error(f"Erro na execução principal: {e}")
+    output_table = pd.DataFrame()
