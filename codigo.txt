@@ -1,178 +1,83 @@
-# -*- coding: utf-8 -*-
-"""
-MKCompliance – 3 tentativas, validação, compactação
-Usa o perfil real do Edge (sem InPrivate)
-
-Atualizado: 17-06-2025
-"""
-
-import os, sys, time, shutil, zipfile
-from datetime import datetime
+# login_once.py
 from pathlib import Path
-
-import pandas as pd
 from playwright.sync_api import sync_playwright, expect
+import shutil 
+import os     
+import pandas as pd # <-- NOVO: Importar pandas para criar o DataFrame de saída
 
-# ------------------------------------------------------------------
-# Funções de log (ASCII seguro)
-# ------------------------------------------------------------------
-def klog(msg: str):
-    sys.stdout.write(msg + "\n"); sys.stdout.flush()
+# --- Configurações ---
+PROFILE = Path("N:/DCGV/Compliance/Compliance RO Varejo/Analytics/Projetos/AgendaNormativa/edge_profile/edge_profile").resolve()
 
-def kerr(msg: str):
-    sys.stderr.write("ERROR: " + msg + "\n"); sys.stderr.flush()
+LOGIN_INIT_URL = "https://bv.mkcompliance.com.br/"
+TARGET_APP_URL_BASE = "https://bv.mkcompliance.com.br/"
 
-# ------------------------------------------------------------------
-# Caminhos dinâmicos
-# ------------------------------------------------------------------
-USER_DOCS = Path(os.environ["USERPROFILE"]) / "Documents"
-RUN_ROOT  = USER_DOCS / "mk"           # C:\Users\<usr>\Documents\mk
-RUN_ROOT.mkdir(exist_ok=True)
+# --- NOVA ETAPA: Limpar o diretório de perfil antes de iniciar ---
+print(f"*** INICIANDO LIMPEZA DO PERFIL ***")
+print(f"Caminho do perfil a ser limpo: {PROFILE}")
 
-# Pasta do perfil Edge padrão (“Default”) do usuário logado
-EDGE_PROFILE = (
-    Path(os.environ["LOCALAPPDATA"])
-    / "Microsoft" / "Edge" / "User Data" / "Default"
-)
+if PROFILE.exists() and PROFILE.is_dir():
+    try:
+        shutil.rmtree(PROFILE)
+        print(f"Diretório '{PROFILE}' e todo o seu conteúdo foram apagados com sucesso.")
+    except OSError as e:
+        print(f"Erro ao apagar o diretório '{PROFILE}': {e}")
+        print("Pode ser necessário fechar qualquer processo que esteja usando esta pasta.")
+else:
+    print(f"Diretório '{PROFILE}' não encontrado ou não é um diretório válido. Não há nada para limpar.")
 
-# ------------------------------------------------------------------
-# URLs de destino
-# ------------------------------------------------------------------
-LOGIN_INIT_URL = (
-    "https://bv.mkcompliance.com.br/auth/realms/alfresco/"
-    "protocol/openid-connect/auth?response_type=code&client_id=alfresco"
-    "&redirect_uri=https://bv.mkcompliance.com.br/mk/compliance.html"
-)
-ADMIN_URL  = "https://bv.mkcompliance.com.br/mk/admin.html#/cfghome"
-LOGIN_BASE = (
-    "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
-)
+print(f"Verificando/Criando diretório de perfil vazio: {PROFILE}")
+PROFILE.mkdir(parents=True, exist_ok=True)
+print(f"*** LIMPEZA CONCLUÍDA. DIRETÓRIO PRONTO PARA USO. ***\n")
 
-TIMEOUT_MS = 90_000
-MIN_COLS   = [
-    "login", "Nome", "Sobrenome", "E-mail",
-    "Telefone", "Departamento", "Área",
-]
+# --- Fim da nova etapa ---
 
-# ------------------------------------------------------------------
-# Uma tentativa de download
-# ------------------------------------------------------------------
-def do_attempt(pw, attempt_dir: Path, n: int) -> pd.DataFrame:
-    file_name = "pontosfocaisMK.xlsx"
-    xlsx_path = attempt_dir / file_name
-    zip_path  = attempt_dir / (file_name + ".zip")
+# Variável para armazenar o status final
+script_status = "Falha no processo de login."
 
-    ctx = page = None
-    df  = pd.DataFrame()
-
-    klog(f"Attempt {n} - {attempt_dir}")
+with sync_playwright() as p:
+    ctx = p.chromium.launch_persistent_context(
+        user_data_dir=PROFILE, 
+        channel="msedge",  
+        headless=False,    
+        args=["--start-maximized"] 
+    )
+    page = ctx.new_page()
 
     try:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=str(EDGE_PROFILE),    # perfil real
-            channel="msedge",
-            headless=False,
-            timeout=TIMEOUT_MS,
-            args=["--profile-directory=Default"]  # garante o perfil certo
-            # (NÃO há --inprivate!)
-        )
-        page = ctx.new_page()
+        print(f"Navegando para a URL de início do login: {LOGIN_INIT_URL}")
+        page.goto(LOGIN_INIT_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # 1) Login (SSO se necessário)
-        page.goto(LOGIN_INIT_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-        if page.url.startswith(LOGIN_BASE):
-            klog("SSO → clicando Microsoft")
-            expect(page.get_by_role("link", name="Microsoft")).to_be_visible(timeout=TIMEOUT_MS)
-            page.get_by_role("link", name="Microsoft").click()
-            page.wait_for_url("https://bv.mkcompliance.com.br/mk/compliance.html**", timeout=TIMEOUT_MS)
+        print("Aguardando o botão 'Microsoft' aparecer...")
+        microsoft_button = page.get_by_role("link", name="Microsoft")
+        expect(microsoft_button).to_be_visible(timeout=20000) 
 
-        # 2) Navegação interna
-        page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-        expect(page.get_by_text("Gestão de Usuários Permite")).to_be_visible(timeout=TIMEOUT_MS)
-        page.get_by_text("Gestão de Usuários Permite").click()
+        print("Clicando no botão 'Microsoft'...")
+        microsoft_button.click()
 
-        # espera coluna “Área”
-        klog("Esperando cabecalho 'Área'")
-        expect(page.locator("th", has_text="Área")).to_be_visible(timeout=TIMEOUT_MS)
-        page.wait_for_timeout(500)
-
-        # 3) Download Excel
-        with page.expect_download(timeout=TIMEOUT_MS) as dl_info:
-            page.get_by_role("button", name="Excel").click()
-        dl = dl_info.value
-        dl.save_as(xlsx_path)
-        klog(f"Salvo em {xlsx_path}")
-
-        # aguarda tamanho estabilizar
-        last = -1
-        while True:
-            size_now = os.path.getsize(xlsx_path)
-            if size_now == last: break
-            last = size_now; time.sleep(0.4)
-
-        # 4) Ler e logar colunas
-        df = pd.read_excel(xlsx_path, header=1, dtype=str)
-        klog(f"Colunas ({len(df.columns)}): {list(df.columns)}")
-
-        # 5) Validação
-        if not all(c in df.columns for c in MIN_COLS):
-            kerr("Colunas mínimas faltando")
-            df = pd.DataFrame()
-        else:
-            klog("Colunas OK")
-
-        # 6) Compacta e remove .xlsx
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(xlsx_path, arcname=file_name)
-        os.remove(xlsx_path)
-        klog("Compactado e .xlsx removido")
+        print(f"Aguardando a conclusão do login e redirecionamento para: {TARGET_APP_URL_BASE}...")
+        page.wait_for_url(TARGET_APP_URL_BASE + "**", timeout=90000) 
+        
+        print("\nLogin no perfil do Edge salvo com SUCESSO!")
+        print(f"O perfil está salvo em: {PROFILE}")
+        print("Você pode fechar a janela do navegador. Agora, seu script principal deve estar logado.")
+        
+        script_status = "Login no perfil do Edge salvo com sucesso!" # Atualiza o status em caso de sucesso
 
     except Exception as e:
-        kerr(f"Falha attempt {n}: {e}")
-        df = pd.DataFrame()
+        print(f"\nERRO durante o processo de login: {e}")
+        print("Verifique se você interagiu corretamente com a tela de login da Microsoft (se apareceu).")
+        print(f"Pode ser necessário limpar o diretório '{PROFILE}' e tentar novamente.")
+        script_status = f"Erro no processo de login: {e}" # Atualiza o status em caso de erro
+
     finally:
-        if ctx: ctx.close()
+        print("Fechando contexto do navegador...")
+        ctx.close()
 
-    return df
+# --- NOVO: Definir a saída para o Knime ---
+# Para o nó 'Python Script' (legacy ou Labs com configurações padrão):
+output_table = pd.DataFrame({"StatusExecucao": [script_status]})
 
-# ------------------------------------------------------------------
-# Pipeline (até 3 tentativas)
-# ------------------------------------------------------------------
-def run_pipeline() -> pd.DataFrame:
-    final_df = pd.DataFrame()
-
-    with sync_playwright() as pw:
-        for n in range(1, 4):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            attempt_dir = RUN_ROOT / f"{ts}_try{n}"
-            attempt_dir.mkdir(parents=True, exist_ok=True)
-
-            df = do_attempt(pw, attempt_dir, n)
-
-            # limpa subpasta
-            shutil.rmtree(attempt_dir, ignore_errors=True)
-
-            if not df.empty:
-                klog(f"Concluído na tentativa {n}")
-                final_df = df
-                break
-
-            klog(f"Tentativa {n} falhou, aguardando 5 s\n")
-            time.sleep(5)
-
-    # remove mk se ficar vazia
-    try:
-        if not any(RUN_ROOT.iterdir()):
-            RUN_ROOT.rmdir()
-    except Exception:
-        pass
-
-    if final_df.empty:
-        kerr("Todas as 3 tentativas falharam")
-
-    return final_df
-
-# ------------------------------------------------------------------
-# Execução (KNIME)
-# ------------------------------------------------------------------
-output_table = run_pipeline()
+# Se você estiver usando o nó 'Python Script (Labs)' e definindo explicitamente as saídas via knime.scripting.io:
+# from knime.scripting import io as knio
+# output_table_1 = pd.DataFrame({"StatusExecucao": [script_status]})
+# knio.send_tables(output_table_1) # Se você usar múltiplas saídas, precisaria disso.
