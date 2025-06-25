@@ -1,4 +1,4 @@
-Apresentação do Projeto – Chatbot de Validação de Peças de Marketing
+ Apresentação do Projeto – Chatbot de Validação de Peças de Marketing
 O presente projeto tem como objetivo a construção de um chatbot inteligente voltado para validação automatizada de peças de marketing, com foco em compliance regulatório e risco operacional. A solução foi desenvolvida utilizando Python com Flask no back-end e HTML, CSS e JavaScript no front-end, integrando recursos de IA Generativa da Google (Vertex AI – Gemini) para interpretar arquivos multimídia conforme regras pré-estabelecidas.
 
 ✅ Funcionalidades principais:
