@@ -1,141 +1,33 @@
-# -*- coding: utf-8 -*-
-"""
-MKCompliance • Edge • Exporta para CSV
-• Abre perfil real do Edge (Default)
-• Seleciona "Exibindo todas as linhas"
-• Baixa Excel, converte para CSV, importa em DataFrame
-17-06-2025
-"""
+Apresentação do Projeto – Chatbot de Validação de Peças de Marketing
+O presente projeto tem como objetivo a construção de um chatbot inteligente voltado para validação automatizada de peças de marketing, com foco em compliance regulatório e risco operacional. A solução foi desenvolvida utilizando Python com Flask no back-end e HTML, CSS e JavaScript no front-end, integrando recursos de IA Generativa da Google (Vertex AI – Gemini) para interpretar arquivos multimídia conforme regras pré-estabelecidas.
 
-import os, sys, time, shutil
-from datetime import datetime
-from pathlib import Path
+✅ Funcionalidades principais:
+Interface interativa de chat, acessível via navegador, com respostas humanizadas e navegação guiada por botões;
 
-import pandas as pd
-from playwright.sync_api import sync_playwright, expect
+Upload de arquivos (.png, .jpg, .pdf, .html, .msg etc.) ou indicação de caminho local para análise em lote;
 
-# ------------------------------------------------------------------
-# Funções de log (ASCII)
-# ------------------------------------------------------------------
-def klog(msg): sys.stdout.write(msg + "\n"); sys.stdout.flush()
-def kerr(msg): sys.stderr.write("ERROR: " + msg + "\n"); sys.stderr.flush()
+Avaliação baseada em um roteiro de regras de compliance (ex: uso de disclaimers obrigatórios, frases vetadas, conformidade com regulamentações SUSEP/BACEN/ANS);
 
-# ------------------------------------------------------------------
-# Caminhos
-# ------------------------------------------------------------------
-USER_DOCS = Path(os.environ["USERPROFILE"]) / "Documents"
-RUN_DIR   = USER_DOCS / "mk_download"          # pasta temporária única
-RUN_DIR.mkdir(exist_ok=True)
+Exportação de resultados em Excel, com pareceres automatizados por categoria e marcação de inconformidades;
 
-EDGE_PROFILE = (
-    Path(os.environ["LOCALAPPDATA"])
-    / "Microsoft" / "Edge" / "User Data" / "Default"
-)
+Mensagens contextualizadas e personalizadas, com saudação, progresso e conclusão informada ao usuário;
 
-# Arquivos
-ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-xlsx_name = f"pontosfocaisMK_{ts}.xlsx"
-csv_name  = f"pontosfocaisMK_{ts}.csv"
-xlsx_path = RUN_DIR / xlsx_name
-csv_path  = RUN_DIR / csv_name
+Possibilidade de execução em modo offline (respostas simuladas) para testes locais sem dependência da IA.
 
-# ------------------------------------------------------------------
-# URLs e timeouts
-# ------------------------------------------------------------------
-LOGIN_INIT_URL = (
-    "https://bv.mkcompliance.com.br/auth/realms/alfresco/"
-    "protocol/openid-connect/auth?response_type=code&client_id=alfresco"
-    "&redirect_uri=https://bv.mkcompliance.com.br/mk/compliance.html"
-)
-ADMIN_URL  = "https://bv.mkcompliance.com.br/mk/admin.html#/cfghome"
-LOGIN_BASE = (
-    "https://bv.mkcompliance.com.br/auth/realms/alfresco/protocol/openid-connect/auth"
-)
+🔗 Tecnologias utilizadas:
+Flask (Python) – para construção do servidor e API;
 
-TIMEOUT_MS      = 90_000   # geral
-TIMEOUT_SHOWALL = 6_000    # Exibindo todas as linhas
+Google Vertex AI (Gemini Flash 2.0) – para análise de linguagem e imagem via IA;
 
-# ------------------------------------------------------------------
-# Execução única
-# ------------------------------------------------------------------
-with sync_playwright() as pw:
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=str(EDGE_PROFILE),
-        channel="msedge",
-        headless=False,
-        timeout=TIMEOUT_MS,
-        args=["--profile-directory=Default"],
-    )
-    page = ctx.new_page()
+JavaScript + HTML + CSS – para interface responsiva do chatbot;
 
-    try:
-        # 1) Login SSO se necessário
-        page.goto(LOGIN_INIT_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-        if page.url.startswith(LOGIN_BASE):
-            klog("SSO - clicando Microsoft")
-            expect(page.get_by_role("link", name="Microsoft")).to_be_visible(timeout=TIMEOUT_MS)
-            page.get_by_role("link", name="Microsoft").click()
-            page.wait_for_url("https://bv.mkcompliance.com.br/mk/compliance.html**", timeout=TIMEOUT_MS)
+Pandas e OpenPyXL – para manipulação e exportação de resultados.
 
-        # 2) Gestão de Usuários
-        page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-        expect(page.get_by_text("Gestão de Usuários Permite")).to_be_visible(timeout=TIMEOUT_MS)
-        page.get_by_text("Gestão de Usuários Permite").click()
+🎯 Benefícios esperados:
+Redução de tempo e esforço na validação manual de materiais;
 
-        # Espera coluna “Área”
-        klog("Esperando cabecalho 'Área'")
-        area_header = page.locator("th", has_text="Área").first
-        expect(area_header).to_be_visible(timeout=TIMEOUT_MS)
-        page.wait_for_timeout(500)
+Mitigação de riscos de comunicação indevida ou não regulada;
 
-        # 3) Exibir todas as linhas
-        klog("Selecionando 'Exibindo todas as linhas'")
-        select_label = page.get_by_label("Exibindo", exact=False)
-        expect(select_label).to_be_visible(timeout=TIMEOUT_SHOWALL)
-        select_label.select_option("-1")
-        page.wait_for_timeout(500)
+Padronização das análises conforme regras atualizadas;
 
-        # 4) Download Excel
-        with page.expect_download(timeout=TIMEOUT_MS) as dl_info:
-            page.get_by_role("button", name="Excel").click()
-        dl = dl_info.value
-        dl.save_as(xlsx_path)
-        klog(f"Excel salvo em {xlsx_path}")
-
-        # aguarda estabilizar
-        last = -1
-        while True:
-            sz = os.path.getsize(xlsx_path)
-            if sz == last: break
-            last = sz; time.sleep(0.4)
-
-    finally:
-        ctx.close()
-
-# ------------------------------------------------------------------
-# 5) Converter para CSV e carregar
-# ------------------------------------------------------------------
-klog("Convertendo para CSV…")
-df_excel = pd.read_excel(xlsx_path, header=1, dtype=str)   # cabeçalho na linha 2
-df_excel.to_csv(csv_path, index=False, encoding="utf-8")
-klog(f"CSV salvo em {csv_path}")
-
-# DataFrame carregado do CSV (opcional, mas atende 'importação no código')
-df_csv = pd.read_csv(csv_path, dtype=str)
-
-# ------------------------------------------------------------------
-# Limpeza da pasta (opcional)
-# ------------------------------------------------------------------
-try:
-    os.remove(xlsx_path)
-except Exception: pass
-
-# Se quiser remover o CSV também depois de usá-lo, descomente:
-# try: os.remove(csv_path)
-# except Exception: pass
-
-# ------------------------------------------------------------------
-# Saída para KNIME
-# ------------------------------------------------------------------
-output_table = df_csv
-klog("Processo concluído.")
+Aumento da eficiência e rastreabilidade nas ações de conformidade.
