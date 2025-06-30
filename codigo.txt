@@ -1,33 +1,120 @@
- Apresentação do Projeto – Chatbot de Validação de Peças de Marketing
-O presente projeto tem como objetivo a construção de um chatbot inteligente voltado para validação automatizada de peças de marketing, com foco em compliance regulatório e risco operacional. A solução foi desenvolvida utilizando Python com Flask no back-end e HTML, CSS e JavaScript no front-end, integrando recursos de IA Generativa da Google (Vertex AI – Gemini) para interpretar arquivos multimídia conforme regras pré-estabelecidas.
+import win32com.client
+from datetime import datetime, timedelta
+import pandas as pd
+from bs4 import BeautifulSoup
+import os
 
-✅ Funcionalidades principais:
-Interface interativa de chat, acessível via navegador, com respostas humanizadas e navegação guiada por botões;
+# Parâmetros de filtro
+data_inicio = "01/03/2025"
+data_fim = "07/03/2025"
+remetente_filtro = "informe@mkcompliance.com.br"
+assunto_fixo = "[EXT] - Normativos Divulgados em "
 
-Upload de arquivos (.png, .jpg, .pdf, .html, .msg etc.) ou indicação de caminho local para análise em lote;
+# Pasta de destino (onde serão salvos o Excel e os anexos)
+pasta_destino = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook"
+arquivo_excel = os.path.join(pasta_destino, "Normativos.xlsx")
 
-Avaliação baseada em um roteiro de regras de compliance (ex: uso de disclaimers obrigatórios, frases vetadas, conformidade com regulamentações SUSEP/BACEN/ANS);
+# Conectar ao Outlook
+outlook = win32com.client.Dispatch("Outlook.Application")
+namespace = outlook.GetNamespace("MAPI")
 
-Exportação de resultados em Excel, com pareceres automatizados por categoria e marcação de inconformidades;
+# Acessar a caixa de entrada (6 = olFolderInbox)
+caixa_entrada = namespace.GetDefaultFolder(6)
 
-Mensagens contextualizadas e personalizadas, com saudação, progresso e conclusão informada ao usuário;
+# Converter datas para datetime (Python)
+data_inicio_dt = datetime.strptime(data_inicio, "%d/%m/%Y")
+data_fim_dt = datetime.strptime(data_fim, "%d/%m/%Y")
 
-Possibilidade de execução em modo offline (respostas simuladas) para testes locais sem dependência da IA.
+# Formatar datas para o filtro do Outlook (MM/DD/YYYY)
+data_inicio_fmt = data_inicio_dt.strftime("%m/%d/%Y")
+data_fim_fmt = data_fim_dt.strftime("%m/%d/%Y")
 
-🔗 Tecnologias utilizadas:
-Flask (Python) – para construção do servidor e API;
+# Montar filtro para ReceivedTime (data de recebimento)
+filtro_data = f"[ReceivedTime] >= '{data_inicio_fmt} 00:00 AM' AND [ReceivedTime] <= '{data_fim_fmt} 11:59 PM'"
 
-Google Vertex AI (Gemini Flash 2.0) – para análise de linguagem e imagem via IA;
+# Montar filtro para Subject (data no assunto, no formato dd/mm/yyyy)
+# Aqui fazemos uma comparação de string (lexicográfica). 
+# Ex.: "[EXT] - Normativos Divulgados em 01/03/2025" até "[EXT] - Normativos Divulgados em 07/03/2025"
+assunto_inicio = assunto_fixo + data_inicio_dt.strftime("%d/%m/%Y")
+assunto_fim = assunto_fixo + data_fim_dt.strftime("%d/%m/%Y")
+filtro_assunto = f"[Subject] >= '{assunto_inicio}' AND [Subject] <= '{assunto_fim}'"
 
-JavaScript + HTML + CSS – para interface responsiva do chatbot;
+# Combinar os dois filtros (ReceivedTime e Subject)
+filtro_combinado = f"({filtro_data}) AND ({filtro_assunto})"
 
-Pandas e OpenPyXL – para manipulação e exportação de resultados.
+# Obter os e-mails que satisfazem o filtro
+emails = caixa_entrada.Items.Restrict(filtro_combinado)
 
-🎯 Benefícios esperados:
-Redução de tempo e esforço na validação manual de materiais;
+# Lista para consolidar tabelas de múltiplos e-mails
+tabelas = []
 
-Mitigação de riscos de comunicação indevida ou não regulada;
+# Lista para armazenar os assuntos dos e-mails identificados
+emails_identificados = []
 
-Padronização das análises conforme regras atualizadas;
+# Colunas esperadas
+colunas_desejadas = ["Tipo", "Número", "Data do Ato", "Órgão", "Ementa", "Vigência"]
 
-Aumento da eficiência e rastreabilidade nas ações de conformidade.
+for email in emails:
+    # Verificar também o remetente
+    if remetente_filtro.lower() in email.SenderEmailAddress.lower():
+        # Tentar extrair a data do assunto (ex.: "Normativos Divulgados em 06/03/2025")
+        if email.Subject.startswith(assunto_fixo):
+            try:
+                data_str = email.Subject.replace(assunto_fixo, "").strip()
+                data_no_assunto = datetime.strptime(data_str, "%d/%m/%Y")
+            except ValueError:
+                # Se não conseguir processar a data do assunto, ignora
+                continue
+
+            # Verificar se a data do assunto está no intervalo desejado
+            # (Boa prática para garantir que a comparação lexicográfica não traga dados fora)
+            if data_inicio_dt <= data_no_assunto <= data_fim_dt:
+                
+                emails_identificados.append(email.Subject)
+
+                # 1) Download de todos os anexos do e-mail
+                if email.Attachments.Count > 0:
+                    for anexo in email.Attachments:
+                        anexo_path = os.path.join(pasta_destino, anexo.FileName)
+                        try:
+                            anexo.SaveAsFile(anexo_path)
+                        except Exception as e:
+                            print(f"Erro ao salvar anexo {anexo.FileName}: {e}")
+
+                # 2) Processar o HTML do corpo do e-mail para extrair a tabela
+                html_corpo = email.HTMLBody
+                soup = BeautifulSoup(html_corpo, "html.parser")
+
+                for table in soup.find_all("table"):
+                    try:
+                        # Lê a tabela com a primeira linha como cabeçalho
+                        df_list = pd.read_html(str(table), header=0)
+                    except ValueError:
+                        continue  # Caso não haja tabelas legíveis
+
+                    for df_temp in df_list:
+                        # Verifica se a tabela possui todas as colunas desejadas
+                        if set(colunas_desejadas).issubset(df_temp.columns):
+
+                            # Cria coluna "data de processamento" (data/hora do recebimento)
+                            df_temp["data de processamento"] = data_no_assunto
+
+                            # (Opcional) Manter somente as colunas desejadas + data de processamento
+                            df_temp = df_temp[colunas_desejadas + ["data de processamento"]]
+
+                            # Adiciona o DataFrame resultante à lista geral
+                            tabelas.append(df_temp)
+
+
+#Print
+print("E-mails identificados:")
+for assunto in emails_identificados:
+    print(assunto)
+                            
+# 3) Consolidação e salvamento no Excel
+if tabelas:
+    df_final = pd.concat(tabelas, ignore_index=True)
+    df_final.to_excel(arquivo_excel, index=False)
+    print(f"Arquivo Excel gerado com sucesso: {arquivo_excel}")
+else:
+    print("Nenhuma tabela encontrada nos e-mails filtrados.")
