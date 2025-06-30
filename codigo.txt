@@ -1,120 +1,185 @@
-import win32com.client
+"""
+Baixa anexos de e-mails de normativos, renomeia os PDFs
+e consolida a tabela contida no corpo do e-mail.
+
+• Filtro de datas é automático: do último dia em que o
+  script rodou até “agora”.
+• Registra a última execução em `ultima_execucao.csv`.
+• Cria uma sub-pasta por dia (AAAA-MM-DD) para os anexos.
+• Renomeia cada PDF no padrão
+  "{Tipo}_{Órgão}_{Número}.pdf"
+• Adiciona colunas DataReferencia (aaaa-mm-dd) e
+  CaminhoNormativo ao DataFrame final.
+"""
+
+import win32com.client                                          # Outlook
 from datetime import datetime, timedelta
 import pandas as pd
 from bs4 import BeautifulSoup
 import os
+import re
+import unicodedata
 
-# Parâmetros de filtro
-data_inicio = "01/03/2025"
-data_fim = "07/03/2025"
-remetente_filtro = "informe@mkcompliance.com.br"
-assunto_fixo = "[EXT] - Normativos Divulgados em "
+# ------------------------------------------------------------------
+# PARÂMETROS FIXOS
+# ------------------------------------------------------------------
+REMETENTE         = "informe@mkcompliance.com.br"
+ASSUNTO_PREFIXO   = "[EXT] - Normativos Divulgados em "
+PASTA_BASE        = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook"
+ARQ_EXCEL_FINAL   = os.path.join(PASTA_BASE, "Normativos.xlsx")
+ARQ_ULTIMA_EXEC   = os.path.join(PASTA_BASE, "ultima_execucao.csv")
 
-# Pasta de destino (onde serão salvos o Excel e os anexos)
-pasta_destino = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook"
-arquivo_excel = os.path.join(pasta_destino, "Normativos.xlsx")
+COLUNAS_TABELA    = ["Tipo", "Número", "Data do Ato",
+                     "Órgão", "Ementa", "Vigência"]
 
-# Conectar ao Outlook
-outlook = win32com.client.Dispatch("Outlook.Application")
+# ------------------------------------------------------------------
+# 1) DEFINE PERÍODO (da última execução até agora)
+# ------------------------------------------------------------------
+hoje = datetime.now()
+
+if os.path.exists(ARQ_ULTIMA_EXEC):
+    ultima_data = pd.read_csv(ARQ_ULTIMA_EXEC)["ultima_data"].iloc[0]
+    data_inicio_dt = datetime.strptime(ultima_data, "%Y-%m-%d") + timedelta(seconds=1)
+else:
+    # primeira execução: busca dos últimos 7 dias
+    data_inicio_dt = hoje - timedelta(days=7)
+
+data_fim_dt = hoje
+
+# grava / atualiza o CSV de controle já no início; se der erro
+# depois, o arquivo será atualizado na próxima rodada
+pd.DataFrame({"ultima_data": [data_fim_dt.strftime("%Y-%m-%d")]}).to_csv(
+    ARQ_ULTIMA_EXEC, index=False, encoding="utf-8"
+)
+
+# ------------------------------------------------------------------
+# 2) CONECTA AO OUTLOOK E FILTRA E-MAILS PELO RECEIVEDTIME
+# ------------------------------------------------------------------
+outlook   = win32com.client.Dispatch("Outlook.Application")
 namespace = outlook.GetNamespace("MAPI")
+caixa     = namespace.GetDefaultFolder(6)                        # Inbox
 
-# Acessar a caixa de entrada (6 = olFolderInbox)
-caixa_entrada = namespace.GetDefaultFolder(6)
+# filtro MAPI precisa de datas em MM/DD/YYYY
+fmt_outlook = "%m/%d/%Y %H:%M %p"
+filtro_data = (f"[ReceivedTime] >= '{data_inicio_dt.strftime(fmt_outlook)}' "
+               f"AND [ReceivedTime] <= '{data_fim_dt.strftime(fmt_outlook)}'")
 
-# Converter datas para datetime (Python)
-data_inicio_dt = datetime.strptime(data_inicio, "%d/%m/%Y")
-data_fim_dt = datetime.strptime(data_fim, "%d/%m/%Y")
+emails = caixa.Items.Restrict(filtro_data)
+emails = emails.Sort("[ReceivedTime]", True)                     # True = desc
 
-# Formatar datas para o filtro do Outlook (MM/DD/YYYY)
-data_inicio_fmt = data_inicio_dt.strftime("%m/%d/%Y")
-data_fim_fmt = data_fim_dt.strftime("%m/%d/%Y")
+# ------------------------------------------------------------------
+# 3) FUNÇÕES AUXILIARES
+# ------------------------------------------------------------------
+def limpa_texto(txt: str) -> str:
+    """Remove acentuação e caracteres inválidos para nomes de ficheiros."""
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode()
+    txt = re.sub(r"[^\w\s\-]", "", txt)      # remove símbolos
+    txt = re.sub(r"\s+", " ", txt).strip()   # espaços duplicados
+    return txt.replace(" ", "_")
 
-# Montar filtro para ReceivedTime (data de recebimento)
-filtro_data = f"[ReceivedTime] >= '{data_inicio_fmt} 00:00 AM' AND [ReceivedTime] <= '{data_fim_fmt} 11:59 PM'"
+def renomeia_anexos(df_email, pasta_do_email, anexos):
+    """
+    Renomeia PDFs com base na tabela df_email.
+    Para cada linha da tabela procura um PDF cujo nome contenha o número.
+    """
+    mapping = {}
+    for _, linha in df_email.iterrows():
+        tipo    = limpa_texto(str(linha["Tipo"]))
+        numero  = re.sub(r"\D", "", str(linha["Número"]))  # apenas dígitos
+        orgao   = limpa_texto(str(linha["Órgão"]))
 
-# Montar filtro para Subject (data no assunto, no formato dd/mm/yyyy)
-# Aqui fazemos uma comparação de string (lexicográfica). 
-# Ex.: "[EXT] - Normativos Divulgados em 01/03/2025" até "[EXT] - Normativos Divulgados em 07/03/2025"
-assunto_inicio = assunto_fixo + data_inicio_dt.strftime("%d/%m/%Y")
-assunto_fim = assunto_fixo + data_fim_dt.strftime("%d/%m/%Y")
-filtro_assunto = f"[Subject] >= '{assunto_inicio}' AND [Subject] <= '{assunto_fim}'"
+        novo_nome = f"{tipo}_{orgao}_{numero}.pdf"
+        novo_path = os.path.join(pasta_do_email, novo_nome)
 
-# Combinar os dois filtros (ReceivedTime e Subject)
-filtro_combinado = f"({filtro_data}) AND ({filtro_assunto})"
+        for anexo_path in anexos:
+            if numero and numero in os.path.basename(anexo_path):
+                try:
+                    os.rename(anexo_path, novo_path)
+                    mapping[numero] = novo_path               # p/ CaminhoNormativo
+                    break
+                except Exception as e:
+                    print(f"Falha ao renomear {anexo_path}: {e}")
+    return mapping
 
-# Obter os e-mails que satisfazem o filtro
-emails = caixa_entrada.Items.Restrict(filtro_combinado)
-
-# Lista para consolidar tabelas de múltiplos e-mails
-tabelas = []
-
-# Lista para armazenar os assuntos dos e-mails identificados
-emails_identificados = []
-
-# Colunas esperadas
-colunas_desejadas = ["Tipo", "Número", "Data do Ato", "Órgão", "Ementa", "Vigência"]
+# ------------------------------------------------------------------
+# 4) PROCESSA E-MAILS
+# ------------------------------------------------------------------
+tabelas_gerais   = []
+assuntos_encontrados = []
 
 for email in emails:
-    # Verificar também o remetente
-    if remetente_filtro.lower() in email.SenderEmailAddress.lower():
-        # Tentar extrair a data do assunto (ex.: "Normativos Divulgados em 06/03/2025")
-        if email.Subject.startswith(assunto_fixo):
-            try:
-                data_str = email.Subject.replace(assunto_fixo, "").strip()
-                data_no_assunto = datetime.strptime(data_str, "%d/%m/%Y")
-            except ValueError:
-                # Se não conseguir processar a data do assunto, ignora
-                continue
+    if REMETENTE.lower() not in email.SenderEmailAddress.lower():
+        continue
+    if not email.Subject.startswith(ASSUNTO_PREFIXO):
+        continue
 
-            # Verificar se a data do assunto está no intervalo desejado
-            # (Boa prática para garantir que a comparação lexicográfica não traga dados fora)
-            if data_inicio_dt <= data_no_assunto <= data_fim_dt:
-                
-                emails_identificados.append(email.Subject)
+    # DATA NO ASSUNTO (garante tratar apenas boletins válidos)
+    data_assunto_str = email.Subject.replace(ASSUNTO_PREFIXO, "").strip()
+    try:
+        data_assunto_dt = datetime.strptime(data_assunto_str, "%d/%m/%Y")
+    except ValueError:
+        continue
 
-                # 1) Download de todos os anexos do e-mail
-                if email.Attachments.Count > 0:
-                    for anexo in email.Attachments:
-                        anexo_path = os.path.join(pasta_destino, anexo.FileName)
-                        try:
-                            anexo.SaveAsFile(anexo_path)
-                        except Exception as e:
-                            print(f"Erro ao salvar anexo {anexo.FileName}: {e}")
+    # cria pasta específica do dia (AAAA-MM-DD)
+    pasta_dia = os.path.join(PASTA_BASE, data_assunto_dt.strftime("%Y-%m-%d"))
+    os.makedirs(pasta_dia, exist_ok=True)
 
-                # 2) Processar o HTML do corpo do e-mail para extrair a tabela
-                html_corpo = email.HTMLBody
-                soup = BeautifulSoup(html_corpo, "html.parser")
+    # --------------------------------------------------------------
+    # 4.1 Baixa anexos
+    # --------------------------------------------------------------
+    paths_anexos_salvos = []
+    for anexo in email.Attachments:
+        nome_anexo = anexo.FileName
+        destino    = os.path.join(pasta_dia, nome_anexo)
+        try:
+            anexo.SaveAsFile(destino)
+            paths_anexos_salvos.append(destino)
+        except Exception as e:
+            print(f"Erro ao salvar {nome_anexo}: {e}")
 
-                for table in soup.find_all("table"):
-                    try:
-                        # Lê a tabela com a primeira linha como cabeçalho
-                        df_list = pd.read_html(str(table), header=0)
-                    except ValueError:
-                        continue  # Caso não haja tabelas legíveis
+    # --------------------------------------------------------------
+    # 4.2 Extrai tabela do corpo
+    # --------------------------------------------------------------
+    soup  = BeautifulSoup(email.HTMLBody, "html.parser")
+    for table in soup.find_all("table"):
+        try:
+            df_candidates = pd.read_html(str(table), header=0)
+        except ValueError:
+            continue
 
-                    for df_temp in df_list:
-                        # Verifica se a tabela possui todas as colunas desejadas
-                        if set(colunas_desejadas).issubset(df_temp.columns):
+        for df in df_candidates:
+            if set(COLUNAS_TABELA).issubset(df.columns):
+                df = df[COLUNAS_TABELA].copy()
 
-                            # Cria coluna "data de processamento" (data/hora do recebimento)
-                            df_temp["data de processamento"] = data_no_assunto
+                # renomeia anexos usando esta tabela
+                mapping_numero_path = renomeia_anexos(df, pasta_dia,
+                                                      paths_anexos_salvos)
 
-                            # (Opcional) Manter somente as colunas desejadas + data de processamento
-                            df_temp = df_temp[colunas_desejadas + ["data de processamento"]]
+                df["DataReferencia"]  = data_assunto_dt.strftime("%Y-%m-%d")
+                df["CaminhoNormativo"] = df["Número"].apply(
+                    lambda n: mapping_numero_path.get(
+                        re.sub(r"\D", "", str(n)),                       # dígitos
+                        "")                                              # vazio se não encontrou
+                )
+                tabelas_gerais.append(df)
 
-                            # Adiciona o DataFrame resultante à lista geral
-                            tabelas.append(df_temp)
+    assuntos_encontrados.append(email.Subject)
 
+# ------------------------------------------------------------------
+# 5) CONSOLIDA E SALVA
+# ------------------------------------------------------------------
+if tabelas_gerais:
+    df_final = pd.concat(tabelas_gerais, ignore_index=True)
 
-#Print
-print("E-mails identificados:")
-for assunto in emails_identificados:
-    print(assunto)
-                            
-# 3) Consolidação e salvamento no Excel
-if tabelas:
-    df_final = pd.concat(tabelas, ignore_index=True)
-    df_final.to_excel(arquivo_excel, index=False)
-    print(f"Arquivo Excel gerado com sucesso: {arquivo_excel}")
+    # salva Excel (sobrescreve ou cria)
+    df_final.to_excel(ARQ_EXCEL_FINAL, index=False)
+
+    # também mantém o DataFrame em memória para usos posteriores
+    print("► Normativos processados:", len(df_final))
+    print("► Excel salvo em:", ARQ_EXCEL_FINAL)
 else:
-    print("Nenhuma tabela encontrada nos e-mails filtrados.")
+    print("Nenhuma tabela compatível encontrada no período.")
+
+print("\nE-mails processados:")
+for s in assuntos_encontrados:
+    print("  •", s)
