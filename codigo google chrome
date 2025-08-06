@@ -1,23 +1,19 @@
-# -------------------------------------------------------------
-# KNIME: 'input_table' -> pandas.DataFrame com as seguintes colunas
-# ClienteBV_CPF, QtdTotalApostas, VlrTotalApostas,
-#                 QtdTotalSaque,  VlrTotalSaque
-# -------------------------------------------------------------
+# input_table vem do KNIME
 import pandas as pd
-import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 
 df = input_table.copy()
 
-# ---------- PARÂMETROS (baseados em pesquisas 2023-2025) ----------
-#
-# • DataSenado 2024 e Locomotiva 2024: 30% apostam ≤1x/mês e gastam ≤R$100
-# • Fecomercio-SP 2024: mediana até R$50, 70 % gastam ≤R$100
-# • Anbima/Datafolha 2025: ativo regular gasta ~R$216; esporádico ~R$102
-# • Banco Central 2024: top 3 % gastam >R$500/mês
-#
-# Fontes detalhadas descritas no relatório de pesquisa.
-# -------------------------------------------------------------
+# ---------- parâmetros baseados em estudos recentes ----------
+# Fontes:
+# - DataSenado 2024
+# - Instituto Locomotiva 2024
+# - Anbima/Datafolha 2025
+# - Banco Central (via Pix) 2024
+# - Fecomercio-SP 2024
 
+# Regras definidas com base nas fontes acima:
 MIN_ATIVO_APOSTAS      = 4      # ≥ 4 apostas/mês
 MIN_ATIVO_VALOR        = 200.0  # > R$200/mês
 
@@ -25,58 +21,39 @@ MAX_ESPORADICO_APOSTAS = 1      # ≤ 1 aposta/mês
 MAX_ESPORADICO_VALOR   = 100.0  # ≤ R$100/mês
 
 MAX_LOW_QTD            = 3      # "poucas apostas" <= 3
-MIN_HIGH_VALOR         = 500.0  # valor alto > R$500 (top 3 %)
+MIN_HIGH_VALOR         = 500.0  # valor alto > R$500 (top 3%)
 
-# ---------- FUNÇÃO DE CLASSIFICAÇÃO REGRAS DE NEGÓCIO ----------
-def classify_bettor(qtd, val):
-    # 1. Não apostador: ambos zero
+# ---------- função ajustada com classificação detalhada ----------
+def classify(row, qtd_hi, val_hi, qtd_col, val_col):
+    qtd = row[qtd_col]
+    val = row[val_col]
+
     if qtd == 0 and val == 0:
         return "Não apostador"
-    # 2. Apostador Ativo
-    if (qtd >= MIN_ATIVO_APOSTAS) and (val > MIN_ATIVO_VALOR):
+    if qtd >= MIN_ATIVO_APOSTAS and val > MIN_ATIVO_VALOR:
         return "Apostador Ativo"
-    # 3. Apostador Esporádico
-    if (qtd <= MAX_ESPORADICO_APOSTAS) and (val <= MAX_ESPORADICO_VALOR):
+    if qtd <= MAX_ESPORADICO_APOSTAS and val <= MAX_ESPORADICO_VALOR:
         return "Apostador Esporádico"
-    # 4. High-Stake Ocasional (poucas apostas + valor alto)
-    if (qtd <= MAX_LOW_QTD) and (val > MIN_HIGH_VALOR):
+    if qtd <= MAX_LOW_QTD and val > MIN_HIGH_VALOR:
         return "High-Stake Ocasional"
-    # 5. Caso intermediário → Regular
     return "Apostador Regular"
 
-# ---------- APLICAÇÃO PARA APOSTAS E SAQUES --------------------
+# ---------- classificação apostas e saques com nova regra ----------
 df["Cluster_Aposta"] = df.apply(
-    lambda r: classify_bettor(r["QtdTotalApostas"], r["VlrTotalApostas"]),
-    axis=1
+    classify, axis=1,
+    args=(None, None, "QtdTotalApostas", "VlrTotalApostas")
 )
-
 df["Cluster_Saque"] = df.apply(
-    lambda r: classify_bettor(r["QtdTotalSaque"], r["VlrTotalSaque"]),
-    axis=1
+    classify, axis=1,
+    args=(None, None, "QtdTotalSaque", "VlrTotalSaque")
 )
 
-# ---------- (OPCIONAL) CLUSTERING ESTATÍSTICO COM NÚMERO FIXO 4 ----------
-# Basta comentar este bloco se não quiser K-Means “caseiro”.
-def kmeans_np(data, k=4, max_iter=100, seed=42):
-    rng = np.random.default_rng(seed)
-    cent = data[rng.choice(data.shape[0], size=k, replace=False)]
-    for _ in range(max_iter):
-        dist   = np.linalg.norm(data[:, None, :] - cent[None, :, :], axis=2)
-        labels = dist.argmin(axis=1)
-        new_cent = np.vstack([
-            data[labels == i].mean(axis=0) if np.any(labels == i) else cent[i]
-            for i in range(k)
-        ])
-        if np.allclose(cent, new_cent):
-            break
-        cent = new_cent
-    return labels
+# ---------- KMeans clustering cruzado (mantido) ----------
+features = df[["QtdTotalApostas","VlrTotalApostas",
+               "QtdTotalSaque"  ,"VlrTotalSaque"  ]].copy()
+scaled   = StandardScaler().fit_transform(features)
+kmeans   = KMeans(n_clusters=4, random_state=42).fit(scaled)
+df["KMeansCluster"] = kmeans.labels_
 
-vars_   = ["QtdTotalApostas","VlrTotalApostas",
-           "QtdTotalSaque"  ,"VlrTotalSaque"]
-X       = df[vars_].astype(float).values
-X_std   = (X - X.mean(axis=0)) / X.std(axis=0, ddof=0)
-df["KMeansCluster"] = kmeans_np(X_std, k=4)
-
-# ---------- EXPORTA PARA O FLUXO KNIME -------------------------
+# ---------- retorno para KNIME ----------
 output_table = df
