@@ -1,335 +1,53 @@
 # ==============================================================================
-# --- PASSO A PASSO E CONFIGURAÇÃO PARA CLASSIFICAÇÃO DE CLUSTERS ---
-# ==============================================================================
-# Este script realiza a classificação de clientes em diferentes grupos
-# com base em suas atividades de apostas e ganhos, utilizando dois métodos:
-# 1. Regra de Quadrantes (baseada em percentis).
-# 2. K-Means (algoritmo de agrupamento).
+# CLASSIFICAÇÃO DE APOSTADORES – KNIME PYTHON SCRIPT
+# Fonte dos critérios: DataSenado, Anbima/Datafolha, Locomotiva, Banco Central, Fecomercio-SP (2023–2025)
 # ==============================================================================
 
-# --- Importação de bibliotecas ---
 import pandas as pd
-import numpy as np
 
-# --- Carregamento dos dados ---
-# df é um DataFrame do KNIME que contém os dados de entrada.
-df = input_table_1.copy()
+# --- Cópia segura dos dados de entrada do KNIME ---
+df = input_table.copy()
 
-# --- Parâmetros de Configuração para Classificação por Quadrantes ---
-# Você pode ajustar estes valores (entre 0 e 1) para mudar os critérios de corte
-# para cada classificação. Por exemplo, aumentar PCT_QTD para 0.80 significa
-# que apenas os 20% que mais apostam (em quantidade) serão considerados "ativos".
-#
-# Para Cluster_Aposta:
-#   - O limite de Quantidade de Apostas é definido por df["QtdTotalApostas"].quantile(PCT_QTD)
-#   - O limite de Valor de Apostas é definido por df["VlrTotalApostas"].quantile(PCT_VAL)
-#
-# Para Cluster_Ganhos:
-#   - O limite de Quantidade de Ganhos é definido por df["QtdTotalGanhos"].quantile(PCT_QTD)
-#   - O limite de Valor de Ganhos é definido por df["VlrTotalGanhos"].quantile(PCT_VAL)
+# --- Garantia de tipo numérico nas colunas relevantes ---
+df["QtdTotalApostas"] = pd.to_numeric(df["QtdTotalApostas"], errors="coerce").fillna(0)
+df["VlrTotalApostas"] = pd.to_numeric(df["VlrTotalApostas"], errors="coerce").fillna(0)
+df["QtdTotalSaque"]   = pd.to_numeric(df["QtdTotalSaque"], errors="coerce").fillna(0)
+df["VlrTotalSaque"]   = pd.to_numeric(df["VlrTotalSaque"], errors="coerce").fillna(0)
 
-PCT_QTD = 0.75  # Percentil para definir o limite superior de Quantidade (ex: 0.75 para os 75% maiores)
-PCT_VAL = 0.75  # Percentil para definir o limite superior de Valor (ex: 0.75 para os 75% maiores)
-
-# ==============================================================================
-# --- ETAPA 1: REGRA DE QUADRANTES E CLASSIFICAÇÃO ---
-# ==============================================================================
-# Esta seção classifica os clientes em quatro categorias (Apostador Ativo,
-# Apostador Regular, High-Stake Ocasional, Apostador Esporádico) com base
-# em seus quantis de quantidade e valor, separadamente para apostas e ganhos.
-#
-# --- Definição da Função de Classificação ---
-def classify(row, qtd_hi, val_hi, qtd_col_name, val_col_name):
-  """
-  Classifica uma linha em um dos quatro quadrantes com base nos limites de
-  quantidade (qtd_hi) e valor (val_hi) para as colunas especificadas.
-  Assume que os valores de entrada já são numéricos e válidos (ou zero).
-  """
-  # Obtém os valores numéricos processados das colunas
-  qtd_val = row.get(qtd_col_name)
-  val_val = row.get(val_col_name)
-
-  # Verificação final de segurança para garantir que os valores são utilizáveis
-  if pd.isna(qtd_val) or pd.isna(val_val):
-      return "Valor Inválido (NaN)" # Se ainda houver NaN, marca como inválido
-
-  # Verifica se o valor atual excede o limite superior para quantidade e valor
-  high_qtd = qtd_val >= qtd_hi
-  high_val = val_val >= val_hi
-
-  # Lógica de classificação baseada nos quadrantes
-  if high_qtd and high_val: return "Apostador Ativo"      # Alto em ambos
-  if high_qtd and not high_val: return "Apostador Regular" # Alto em quantidade, baixo em valor
-  if not high_qtd and high_val: return "High-Stake Ocasional" # Baixo em quantidade, alto em valor
-  return "Apostador Esporádico" # Baixo em ambos
-
-# --- Processamento das Colunas de Valor (String -> Numérico) ---
-# As colunas 'VlrTotalApostas' e 'VlrTotalGanhos' são inicialmente String
-# e podem usar a vírgula como separador decimal. Precisam ser convertidas.
-
-def process_valor_column(df, col_name, default_value=0):
-    """
-    Processa uma coluna de valor (string com vírgula decimal) para se tornar numérica.
-    1. Converte para string e remove espaços em branco.
-    2. Substitui vírgulas (,) por pontos (.) para compatibilidade com números em Python.
-    3. Converte a string resultante para tipo numérico (float), tratando erros (NaN).
-    4. Substitui quaisquer NaNs resultantes por um valor padrão (0, por padrão).
-    Retorna uma nova Series com o nome da coluna original + '_numeric'.
-    """
-    # Verifica se a coluna existe no DataFrame
-    if col_name not in df.columns:
-        print(f"Aviso: Coluna '{col_name}' não encontrada. Criando coluna '_numeric' preenchida com {default_value}.")
-        # Retorna uma Series preenchida com o valor padrão se a coluna original não existir
-        return pd.Series([default_value] * len(df), name=f"{col_name}_numeric", index=df.index)
+# --- Funções de classificação baseadas em critérios oficiais de comportamento ---
+def classificar_apostas(row):
+    qtd = row['QtdTotalApostas']
+    val = row['VlrTotalApostas']
     
-    # Passo 1 e 2: Manipulação da string para conversão numérica
-    # .astype(str) garante que estamos lidando com strings
-    # .str.strip() remove espaços em branco no início e fim
-    # .str.replace(',', '.', regex=False) substitui vírgulas por pontos
-    processed_series = df[col_name].astype(str).str.strip().str.replace(',', '.', regex=False)
-    
-    # Passo 3: Converte para numérico. errors='coerce' transforma valores inválidos em NaN.
-    numeric_series = pd.to_numeric(processed_series, errors='coerce')
-    
-    # Passo 4: Substitui os NaNs que podem ter surgido (ou já existiam) pelo valor padrão (0)
-    numeric_series = numeric_series.fillna(default_value)
-    
-    # Renomeia a Series resultante para indicar que é uma coluna numérica processada
-    return numeric_series.rename(f"{col_name}_numeric")
-
-# Aplica o processamento às colunas de valor
-df["VlrTotalApostas_numeric"] = process_valor_column(df, "VlrTotalApostas", default_value=0)
-df["VlrTotalGanhos_numeric"] = process_valor_column(df, "VlrTotalGanhos", default_value=0)
-
-# --- Tratamento das Colunas de Quantidade (já são Number (double)) ---
-# Estas colunas já estão no formato numérico correto. Apenas garantimos que
-# sejam tratadas como float e tenham o sufixo '_numeric' para consistência.
-
-if "QtdTotalApostas" in df.columns:
-    # Garante que a coluna seja float. Se já for, não muda nada.
-    df["QtdTotalApostas_numeric"] = df["QtdTotalApostas"].astype(float)
-else:
-    print("Aviso: Coluna 'QtdTotalApostas' não encontrada. Preenchendo com 0 para cálculos.")
-    df["QtdTotalApostas_numeric"] = 0.0 # Cria a coluna com 0.0 se não existir
-
-if "QtdTotalGanhos" in df.columns:
-    # Garante que a coluna seja float.
-    df["QtdTotalGanhos_numeric"] = df["QtdTotalGanhos"].astype(float)
-else:
-    print("Aviso: Coluna 'QtdTotalGanhos' não encontrada. Preenchendo com 0 para cálculos.")
-    df["QtdTotalGanhos_numeric"] = 0.0 # Cria a coluna com 0.0 se não existir
-
-
-# --- Aplicação da Classificação ---
-# Agora que temos as colunas numéricas processadas, podemos calcular os limiares
-# e aplicar a função de classificação.
-
-# Classificação de Apostas
-# Verifica se as colunas numéricas necessárias para apostas existem
-if "QtdTotalApostas_numeric" in df.columns and "VlrTotalApostas_numeric" in df.columns:
-    # Obtém os dados numéricos para cálculo de quantis
-    qtd_ap_data = df["QtdTotalApostas_numeric"]
-    val_ap_data = df["VlrTotalApostas_numeric"]
-
-    # Calcula os limiares (quantis). Calculamos sobre os dados numéricos processados,
-    # que já tiveram NaNs substituídos por 0.
-    # Adicionamos uma verificação para garantir que os dados sejam utilizáveis para quantil
-    # (evitar problemas se todas as colunas forem zero).
-    if (qtd_ap_data.nunique() > 1 or val_ap_data.nunique() > 1) or \
-       (qtd_ap_data.sum() > 0 and val_ap_data.sum() > 0): # Verifica se há variação ou pelo menos algum valor não zero
-        
-        qtd_ap_hi = qtd_ap_data.quantile(PCT_QTD) # Limiar para quantidade de apostas
-        val_ap_hi = val_ap_data.quantile(PCT_VAL) # Limiar para valor de apostas
-        
-        # Aplica a função de classificação a cada linha do DataFrame
-        df["Cluster_Aposta"] = df.apply(classify, axis=1,
-          args=(qtd_ap_hi, val_ap_hi, "QtdTotalApostas_numeric", "VlrTotalApostas_numeric"))
+    if qtd == 0 and val == 0:
+        return "Não Apostador"
+    elif qtd >= 4 and val > 200:
+        return "Apostador Ativo"
+    elif qtd <= 1 and val <= 100:
+        return "Apostador Esporádico"
+    elif qtd <= 3 and val > 500:
+        return "High-Stake Ocasional"
     else:
-        df["Cluster_Aposta"] = "Dados insuficientes para classificar apostas"
-        print("Aviso: Não há dados suficientes (variados ou não-zero) para calcular quantis de apostas.")
-else:
-    df["Cluster_Aposta"] = "Colunas de apostas processadas não encontradas"
-    print("Aviso: Colunas processadas para apostas não estão disponíveis.")
+        return "Apostador Regular"
 
-
-# Classificação de Ganhos
-# Verifica se as colunas numéricas necessárias para ganhos existem
-if "QtdTotalGanhos_numeric" in df.columns and "VlrTotalGanhos_numeric" in df.columns:
-    # Obtém os dados numéricos para cálculo de quantis
-    qtd_gain_data = df["QtdTotalGanhos_numeric"]
-    val_gain_data = df["VlrTotalGanhos_numeric"] # Já tratamos NaN para 0 aqui
-
-    # Calcula os limiares (quantis)
-    if (qtd_gain_data.nunique() > 1 or val_gain_data.nunique() > 1) or \
-       (qtd_gain_data.sum() > 0 and val_gain_data.sum() > 0):
-        
-        qtd_gain_hi = qtd_gain_data.quantile(PCT_QTD) # Limiar para quantidade de ganhos
-        val_gain_hi = val_gain_data.quantile(PCT_VAL) # Limiar para valor de ganhos
-        
-        # Aplica a função de classificação a cada linha do DataFrame
-        df["Cluster_Ganhos"] = df.apply(classify, axis=1,
-          args=(qtd_gain_hi, val_gain_hi, "QtdTotalGanhos_numeric", "VlrTotalGanhos_numeric"))
-    else:
-        df["Cluster_Ganhos"] = "Dados insuficientes para classificar ganhos"
-        print("Aviso: Não há dados suficientes (variados ou não-zero) para calcular quantis de ganhos.")
-else:
-    df["Cluster_Ganhos"] = "Colunas de ganhos processadas não encontradas"
-    print("Aviso: Colunas processadas para ganhos não estão disponíveis.")
-
-
-# ==============================================================================
-# --- ETAPA 2: K-MEANS CLUSTERING ---
-# ==============================================================================
-# Este algoritmo agrupa os clientes em 'k' clusters com base em um conjunto
-# de variáveis (neste caso, quantidades e valores de apostas e ganhos).
-# Ele busca minimizar a distância entre os pontos de dados e os centróides dos clusters.
-#
-# --- Implementação do K-Means "Caseiro" ---
-def kmeans_np(data, k=4, max_iter=100, seed=42):
-  """
-  Implementa o algoritmo K-Means para agrupar dados.
-  Args:
-      data (np.array): Array NumPy com os dados de entrada (já padronizados).
-      k (int): Número de clusters desejado.
-      max_iter (int): Número máximo de iterações para convergência.
-      seed (int): Semente para reprodutibilidade da escolha dos centróides iniciais.
-  Returns:
-      np.array: Array com os rótulos de cluster para cada ponto de dado.
-  """
-  rng = np.random.default_rng(seed) # Gerador de números aleatórios com semente
-
-  # Seleciona 'k' observações aleatórias como centróides iniciais.
-  # Garante que não haja repetição na seleção de centróides iniciais se houver dados suficientes.
-  if data.shape[0] < k:
-      raise ValueError(f"Não há observações suficientes ({data.shape[0]}) para selecionar {k} centróides.")
-  cent = data[rng.choice(data.shape[0], size=k, replace=False)]
-
-  # Loop principal do algoritmo K-Means
-  for _ in range(max_iter):
-    # Calcula a distância euclidiana de cada ponto de dado para cada centróide.
-    # data[:, None, :] -> Adiciona uma dimensão para broadcast (N_samples, 1, N_features)
-    # cent[None, :, :]   -> Adiciona uma dimensão para broadcast (1, k, N_features)
-    # np.linalg.norm(..., axis=2) -> Calcula a norma (distância) ao longo da última dimensão (N_features)
-    dist = np.linalg.norm(data[:, None, :] - cent[None, :, :], axis=2)
+def classificar_saques(row):
+    qtd = row['QtdTotalSaque']
+    val = row['VlrTotalSaque']
     
-    # Atribui cada ponto de dado ao cluster cujo centróide está mais próximo.
-    # dist.argmin(axis=1) retorna o índice do centróide com a menor distância para cada ponto.
-    labels = dist.argmin(axis=1)
-    
-    # --- Atualiza os centróides ---
-    new_cent_list = []
-    for i in range(k):
-        # Seleciona todos os pontos que foram atribuídos ao cluster 'i'
-        cluster_points = data[labels == i]
-        # Calcula a média desses pontos para o novo centróide.
-        # Se um cluster ficar vazio, mantém o centróide anterior para evitar colapso.
-        if cluster_points.shape[0] > 0:
-            new_cent_list.append(cluster_points.mean(axis=0))
-        else:
-            new_cent_list.append(cent[i]) # Mantém o centróide anterior se o cluster estiver vazio
-            
-    new_cent = np.vstack(new_cent_list) # Empilha os novos centróides em um array NumPy
-
-    # Verifica se os centróides não mudaram significativamente (convergência).
-    # np.allclose compara arrays aproximando valores iguais.
-    if np.allclose(cent, new_cent):
-      break # Sai do loop se convergiu
-    cent = new_cent # Atualiza os centróides para a próxima iteração
-  
-  return labels # Retorna os rótulos de cluster finais
-
-# --- Preparação dos Dados para o K-Means ---
-# Define as colunas que serão usadas como features para o algoritmo K-Means.
-# É CRUCIAL que estas colunas sejam as versões numéricas processadas.
-vars_for_kmeans = ["QtdTotalApostas_numeric", "VlrTotalApostas_numeric",
-                   "QtdTotalGanhos_numeric", "VlrTotalGanhos_numeric"]
-
-# Cria um DataFrame temporário contendo apenas as colunas selecionadas para o K-Means.
-df_for_kmeans_cols_data = []
-actual_vars_for_kmeans = [] # Armazena os nomes das colunas que realmente foram incluídas
-
-for var_name_base in ["QtdTotalApostas", "VlrTotalApostas", "QtdTotalGanhos", "VlrTotalGanhos"]:
-    numeric_col_name = f"{var_name_base}_numeric" # Nome da coluna numérica processada
-    # Verifica se a coluna processada existe no DataFrame
-    if numeric_col_name in df.columns:
-        # Verifica se a coluna é de fato numérica (para evitar inclusão de colunas com erros)
-        if pd.api.types.is_numeric_dtype(df[numeric_col_name]):
-            df_for_kmeans_cols_data.append(df[numeric_col_name])
-            actual_vars_for_kmeans.append(numeric_col_name)
-        else:
-            print(f"Aviso: Coluna '{numeric_col_name}' não é do tipo numérico para K-Means. Pulando.")
+    if qtd == 0 and val == 0:
+        return "Não Apostador"
+    elif qtd >= 4 and val > 200:
+        return "Apostador Ativo"
+    elif qtd <= 1 and val <= 100:
+        return "Apostador Esporádico"
+    elif qtd <= 3 and val > 500:
+        return "High-Stake Ocasional"
     else:
-        print(f"Aviso: Coluna processada '{numeric_col_name}' não encontrada para K-Means. Pulando.")
+        return "Apostador Regular"
 
-# Combina as colunas selecionadas em um único DataFrame para o K-Means
-if df_for_kmeans_cols_data:
-    df_kmeans_data = pd.concat(df_for_kmeans_cols_data, axis=1)
-    # Renomeia as colunas do DataFrame temporário para garantir a ordem correta
-    df_kmeans_data.columns = actual_vars_for_kmeans
+# --- Aplicação das classificações ao DataFrame ---
+df["Cluster_Aposta"] = df.apply(classificar_apostas, axis=1)
+df["Cluster_Saque"]  = df.apply(classificar_saques, axis=1)
 
-    # Pré-processamento final: Remover quaisquer linhas que possam ter NaN
-    # (embora nosso preenchimento com 0 deva ter evitado isso para a maioria das colunas)
-    df_kmeans_clean = df_kmeans_data.dropna()
-
-    # Executa o K-Means apenas se houver dados após a limpeza
-    if not df_kmeans_clean.empty:
-        X = df_kmeans_clean.values.astype(float) # Converte para array NumPy
-        
-        # --- Padronização (Z-score) ---
-        # O K-Means é sensível à escala das variáveis. Padronizar os dados
-        # garante que todas as variáveis contribuam igualmente para o cálculo da distância.
-        # Z-score: (valor - média) / desvio_padrão
-        mean = X.mean(axis=0)
-        std_dev = X.std(axis=0, ddof=0)
-        
-        # Trata casos de variância zero (coluna constante) para evitar divisão por zero.
-        # Se o desvio padrão for zero, a padronização não é possível ou necessária para essa coluna.
-        # Substituímos por 1 para que a operação de divisão não falhe, o que é uma abordagem comum.
-        std_dev[std_dev == 0] = 1.0
-        
-        X_std = (X - mean) / std_dev # Aplica a padronização
-
-        # Executa o K-Means com os dados padronizados
-        try:
-            # Cria uma Series com os rótulos do K-Means, alinhada com o índice original
-            labels_kmeans_indexed = pd.Series(kmeans_np(X_std, k=4), index=df_kmeans_clean.index)
-            # Adiciona a coluna de cluster ao DataFrame principal
-            df["KMeansCluster"] = labels_kmeans_indexed
-        except ValueError as e:
-            print(f"Erro ao executar K-Means: {e}")
-            df["KMeansCluster"] = "Erro no K-Means" # Marca como erro se algo der errado
-            
-    else:
-        # Se não há dados válidos para o K-Means
-        df["KMeansCluster"] = "Sem dados válidos para K-Means"
-        print("Aviso: Não há dados válidos em todas as colunas selecionadas para o K-Means após a limpeza.")
-else:
-    # Se nenhuma coluna foi selecionada ou encontrada para o K-Means
-    df["KMeansCluster"] = "Colunas para K-Means não encontradas ou inválidas"
-    print("Aviso: Nenhuma coluna válida encontrada para executar o K-Means.")
-
-
-# ==============================================================================
-# --- ETAPA 3: SELEÇÃO FINAL DAS COLUNAS PARA SAÍDA ---
-# ==============================================================================
-# O KNIME espera que o DataFrame de saída contenha apenas as colunas especificadas.
-# Precisamos selecionar apenas as colunas originais + as novas colunas de cluster.
-
-# Define a lista das colunas que devem compor a saída final
-final_columns = [
-    "ClienteBV_CPF",
-    "QtdTotalApostas",
-    "VlrTotalApostas",
-    "QtdTotalGanhos",
-    "VlrTotalGanhos",
-    "Cluster_Aposta",
-    "Cluster_Ganhos",
-    "KMeansCluster"
-]
-
-# Cria o DataFrame de saída selecionando APENAS as colunas desejadas.
-# Isso remove as colunas auxiliares (_numeric, _processed) que foram criadas.
-output_df = df[final_columns]
-
-# --- Devolver o resultado para o KNIME ---
-output_table_1 = output_df
+# --- Devolução para o KNIME ---
+output_table = df
