@@ -1,52 +1,54 @@
-# input_table: DataFrame de entrada vindo do KNIME
+# input_table: DataFrame fornecido pelo nó do KNIME
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
+import numpy as np
 
 df = input_table.copy()
 
-# ---------- parâmetros facilmente ajustáveis ----------
-PCT_QTD  = 0.75   # percentil para linha de corte de quantidade
-PCT_VAL  = 0.75   # percentil para linha de corte de valor
-N_KMEANS = 4      # n.º de clusters K-Means
+# ---------- 1. regra de quadrantes (sem mudanças) ----------
+PCT_QTD = 0.75
+PCT_VAL = 0.75
 
-# ---------- função de rotulagem por quadrante ----------
 def classify(row, qtd_hi, val_hi, qtd_col, val_col):
     high_qtd = row[qtd_col] >= qtd_hi
     high_val = row[val_col] >= val_hi
-    if  high_qtd and  high_val:
-        return "Apostador Ativo"
-    if  high_qtd and not high_val:
-        return "Apostador Regular"
-    if not high_qtd and  high_val:
-        return "High-Stake Ocasional"
+    if  high_qtd and  high_val:  return "Apostador Ativo"
+    if  high_qtd and not high_val: return "Apostador Regular"
+    if not high_qtd and  high_val: return "High-Stake Ocasional"
     return "Apostador Esporádico"
 
-# ---------- linhas de corte ----------
 qtd_ap_hi = df["QtdTotalApostas"].quantile(PCT_QTD)
 val_ap_hi = df["VlrTotalApostas"].quantile(PCT_VAL)
-
 qtd_sq_hi = df["QtdTotalSaque"].quantile(PCT_QTD)
 val_sq_hi = df["VlrTotalSaque"].quantile(PCT_VAL)
 
-# ---------- clusters rule-based ----------
-df["Cluster_Aposta"] = df.apply(
-    classify, axis=1,
-    args=(qtd_ap_hi, val_ap_hi, "QtdTotalApostas", "VlrTotalApostas")
-)
-df["Cluster_Saque"] = df.apply(
-    classify, axis=1,
-    args=(qtd_sq_hi, val_sq_hi, "QtdTotalSaque", "VlrTotalSaque")
-)
+df["Cluster_Aposta"] = df.apply(classify, axis=1,
+    args=(qtd_ap_hi, val_ap_hi, "QtdTotalApostas", "VlrTotalApostas"))
+df["Cluster_Saque"]  = df.apply(classify, axis=1,
+    args=(qtd_sq_hi, val_sq_hi, "QtdTotalSaque",  "VlrTotalSaque"))
 
-# ---------- K-Means opcional cruzado ----------
-features = df[["QtdTotalApostas","VlrTotalApostas",
-               "QtdTotalSaque"  ,"VlrTotalSaque"  ]]
-scaled   = StandardScaler().fit_transform(features)
-df["KMeansCluster"] = (
-    KMeans(n_clusters=N_KMEANS, random_state=42)
-    .fit_predict(scaled)
-)
+# ---------- 2. K-Means "caseiro" ---------------------------------
+def kmeans_np(data, k=4, max_iter=100, seed=42):
+    rng = np.random.default_rng(seed)
+    # escolhe k observações aleatórias como centróides iniciais
+    cent = data[rng.choice(data.shape[0], size=k, replace=False)]
+    for _ in range(max_iter):
+        # distância euclidiana para cada centróide
+        dist = np.linalg.norm(data[:, None, :] - cent[None, :, :], axis=2)
+        labels = dist.argmin(axis=1)
+        new_cent = np.vstack([data[labels == i].mean(axis=0) if np.any(labels == i)
+                              else cent[i] for i in range(k)])
+        if np.allclose(cent, new_cent):       # convergiu
+            break
+        cent = new_cent
+    return labels
 
-# ---------- devolver ao KNIME ----------
+# seleciona variáveis e padroniza (z-score)
+vars_ = ["QtdTotalApostas","VlrTotalApostas",
+         "QtdTotalSaque","VlrTotalSaque"]
+X = df[vars_].values.astype(float)
+X_std = (X - X.mean(axis=0)) / X.std(axis=0, ddof=0)
+
+df["KMeansCluster"] = kmeans_np(X_std, k=4)
+
+# ---------- 3. devolver ao KNIME -----------------------------
 output_table = df
