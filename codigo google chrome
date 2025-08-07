@@ -1,24 +1,63 @@
 # ==============================================================================
-# CLASSIFICAÇÃO DE APOSTADORES – KNIME PYTHON SCRIPT
-# Fonte dos critérios: DataSenado, Anbima/Datafolha, Locomotiva, Banco Central, Fecomercio-SP (2023–2025)
+# --- CLASSIFICAÇÃO DE APOSTADORES POR QUANTIS E PESQUISA OFICIAL ---
+# Fonte das métricas fixas: DataSenado, Anbima/Datafolha, Locomotiva, Banco Central, Fecomercio-SP
+# KNIME: input_table_1 como entrada | output_table_1 como saída
 # ==============================================================================
 
 import pandas as pd
+import numpy as np
 
-# --- Cópia segura dos dados de entrada do KNIME ---
-df = input_table.copy()
+# --- Copiando o DataFrame de entrada do KNIME ---
+df = input_table_1.copy()
 
-# --- Garantia de tipo numérico nas colunas relevantes ---
-df["QtdTotalApostas"] = pd.to_numeric(df["QtdTotalApostas"], errors="coerce").fillna(0)
-df["VlrTotalApostas"] = pd.to_numeric(df["VlrTotalApostas"], errors="coerce").fillna(0)
-df["QtdTotalSaque"]   = pd.to_numeric(df["QtdTotalSaque"], errors="coerce").fillna(0)
-df["VlrTotalSaque"]   = pd.to_numeric(df["VlrTotalSaque"], errors="coerce").fillna(0)
+# --- Parâmetros para quantis (método quadrantes) ---
+PCT_QTD = 0.75
+PCT_VAL = 0.75
 
-# --- Funções de classificação baseadas em critérios oficiais de comportamento ---
-def classificar_apostas(row):
-    qtd = row['QtdTotalApostas']
-    val = row['VlrTotalApostas']
-    
+# --- Função original de classificação baseada em percentis ---
+def classify(row, qtd_hi, val_hi, qtd_col_name, val_col_name):
+    qtd_val = row.get(qtd_col_name)
+    val_val = row.get(val_col_name)
+    if pd.isna(qtd_val) or pd.isna(val_val):
+        return "Valor Inválido (NaN)"
+    high_qtd = qtd_val >= qtd_hi
+    high_val = val_val >= val_hi
+    if high_qtd and high_val:
+        return "Apostador Ativo"
+    if high_qtd and not high_val:
+        return "Apostador Regular"
+    if not high_qtd and high_val:
+        return "High-Stake Ocasional"
+    return "Apostador Esporádico"
+
+# --- Conversão das colunas em valores numéricos seguros ---
+df["VlrTotalApostas_numeric"] = pd.to_numeric(df.get("VlrTotalApostas", 0), errors='coerce').fillna(0)
+df["VlrTotalGanhos_numeric"] = pd.to_numeric(df.get("VlrTotalGanhos", 0), errors='coerce').fillna(0)
+df["QtdTotalApostas_numeric"] = pd.to_numeric(df.get("QtdTotalApostas", 0), errors='coerce').fillna(0)
+df["QtdTotalGanhos_numeric"] = pd.to_numeric(df.get("QtdTotalGanhos", 0), errors='coerce').fillna(0)
+
+# --- Classificação baseada em quantis (Cluster_Aposta e Cluster_Ganhos) ---
+if df["QtdTotalApostas_numeric"].sum() > 0 and df["VlrTotalApostas_numeric"].sum() > 0:
+    qtd_ap_hi = df["QtdTotalApostas_numeric"].quantile(PCT_QTD)
+    val_ap_hi = df["VlrTotalApostas_numeric"].quantile(PCT_VAL)
+    df["Cluster_Aposta"] = df.apply(classify, axis=1,
+        args=(qtd_ap_hi, val_ap_hi, "QtdTotalApostas_numeric", "VlrTotalApostas_numeric"))
+else:
+    df["Cluster_Aposta"] = "Dados insuficientes para classificar apostas"
+
+if df["QtdTotalGanhos_numeric"].sum() > 0 and df["VlrTotalGanhos_numeric"].sum() > 0:
+    qtd_gain_hi = df["QtdTotalGanhos_numeric"].quantile(PCT_QTD)
+    val_gain_hi = df["VlrTotalGanhos_numeric"].quantile(PCT_VAL)
+    df["Cluster_Ganhos"] = df.apply(classify, axis=1,
+        args=(qtd_gain_hi, val_gain_hi, "QtdTotalGanhos_numeric", "VlrTotalGanhos_numeric"))
+else:
+    df["Cluster_Ganhos"] = "Dados insuficientes para classificar ganhos"
+
+# ==============================================================================
+# --- CLASSIFICAÇÃO ADICIONAL BASEADA EM MÉTRICAS FIXAS DE PESQUISA ---
+# ==============================================================================
+
+def classificar_apostas_pesquisa(qtd, val):
     if qtd == 0 and val == 0:
         return "Não Apostador"
     elif qtd >= 4 and val > 200:
@@ -30,10 +69,7 @@ def classificar_apostas(row):
     else:
         return "Apostador Regular"
 
-def classificar_saques(row):
-    qtd = row['QtdTotalSaque']
-    val = row['VlrTotalSaque']
-    
+def classificar_saques_pesquisa(qtd, val):
     if qtd == 0 and val == 0:
         return "Não Apostador"
     elif qtd >= 4 and val > 200:
@@ -45,9 +81,30 @@ def classificar_saques(row):
     else:
         return "Apostador Regular"
 
-# --- Aplicação das classificações ao DataFrame ---
-df["Cluster_Aposta"] = df.apply(classificar_apostas, axis=1)
-df["Cluster_Saque"]  = df.apply(classificar_saques, axis=1)
+df["Cluster_Aposta_Pesquisa"] = df.apply(
+    lambda row: classificar_apostas_pesquisa(
+        row["QtdTotalApostas_numeric"], row["VlrTotalApostas_numeric"]
+    ), axis=1
+)
 
-# --- Devolução para o KNIME ---
-output_table = df
+df["Cluster_Ganhos_Pesquisa"] = df.apply(
+    lambda row: classificar_saques_pesquisa(
+        row["QtdTotalGanhos_numeric"], row["VlrTotalGanhos_numeric"]
+    ), axis=1
+)
+
+# --- Seleção final das colunas para saída no KNIME ---
+final_columns = [
+    "ClienteBV_CPF",
+    "QtdTotalApostas",
+    "VlrTotalApostas",
+    "QtdTotalGanhos",
+    "VlrTotalGanhos",
+    "Cluster_Aposta",
+    "Cluster_Ganhos",
+    "Cluster_Aposta_Pesquisa",
+    "Cluster_Ganhos_Pesquisa"
+]
+
+output_table_1 = df[final_columns]
+ 
