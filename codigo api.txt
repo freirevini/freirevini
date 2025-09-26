@@ -1,1 +1,230 @@
-ooo
+# -*- coding: utf-8 -*-
+"""
+POC: buscar descritivo (ementa) no DOU a partir de:
+- órgão regulador (ex.: "Banco Central do Brasil" ou "Conselho Monetário Nacional")
+- tipo (ex.: "Resolução BCB", "Resolução CMN", "Circular", "Carta Circular")
+- número (ex.: "277")
+- data de publicação (YYYY-MM-DD)
+
+Fluxo:
+1) Monta uma query e consulta o buscador do DOU (in.gov.br/consulta).
+2) Abre a página do resultado e extrai título + descritivo.
+3) Fallback: consulta LexML (SRU) para obter a ementa, se o DOU não responder.
+
+Requisitos:
+pip install requests beautifulsoup4 lxml
+"""
+
+import re
+import json
+import time
+import urllib.parse as ul
+import requests
+from bs4 import BeautifulSoup
+
+DOU_SEARCH_URL = "https://www.in.gov.br/consulta/-/buscar/dou"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; dou-bot/1.0; +https://example.org)",
+    "Accept-Language": "pt-BR,pt;q=0.9"
+}
+
+def _first_text(*vals):
+    for v in vals:
+        if v:
+            v = v.strip()
+            if v:
+                return v
+    return ""
+
+def _clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+def _extract_description_from_article_html(html):
+    """Heurísticas para extrair a ementa/descrição da página da matéria do DOU."""
+    soup = BeautifulSoup(html, "lxml")
+
+    # 1) Tenta JSON-LD (quando presente)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                desc = data.get("description") or data.get("alternativeHeadline")
+                if desc:
+                    return _clean(desc)
+            elif isinstance(data, list):
+                for d in data:
+                    if isinstance(d, dict):
+                        desc = d.get("description") or d.get("alternativeHeadline")
+                        if desc:
+                            return _clean(desc)
+        except Exception:
+            pass
+
+    # 2) Tenta meta description
+    meta = soup.find("meta", attrs={"name": "description"})
+    if meta and meta.get("content"):
+        return _clean(meta["content"])
+
+    # 3) Tenta “og:description”
+    meta = soup.find("meta", property="og:description")
+    if meta and meta.get("content"):
+        return _clean(meta["content"])
+
+    # 4) Tenta primeiros parágrafos do corpo do artigo
+    # (cada template do DOU pode variar; pegamos os 1–3 primeiros <p>)
+    ps = soup.select("article p, #materia p, .article-content p, .content p")
+    first_pars = " ".join(_clean(p.get_text(" ")) for p in ps[:3])
+    return _clean(first_pars)
+
+def _search_dou(orgao, tipo, numero, data_publicacao):
+    """
+    Consulta o buscador do DOU.
+    Retorna: lista de dicts com {title, url, snippet}
+    """
+    # Query bem restritiva: "tipo numero" + orgão
+    # Ex.: "Resolução BCB 277" "Banco Central do Brasil"
+    q = f"\"{tipo} {numero}\" \"{orgao}\""
+    params = {
+        "q": q,
+        "s": "todos",           # em todas as seções
+        "exactDate": data_publicacao,  # 'YYYY-MM-DD' ou 'all'
+        "sortType": "0",        # relevância
+        "page": "1"
+    }
+
+    resp = requests.get(DOU_SEARCH_URL, params=params, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+
+    # O endpoint geralmente retorna HTML do Liferay; parseamos por links para /web/dou/
+    soup = BeautifulSoup(resp.text, "lxml")
+    items = []
+    for a in soup.select('a[href*="/web/dou/"], a[href*="/materia/-/"]'):
+        url = ul.urljoin(DOU_SEARCH_URL, a.get("href"))
+        title = _clean(a.get_text(" "))
+        if not title:
+            continue
+
+        # pega um trecho próximo (irmãos)
+        parent = a.find_parent()
+        snippet = ""
+        if parent:
+            sib_texts = " ".join(_clean(x.get_text(" ")) for x in parent.find_all("p"))
+            snippet = sib_texts[:400]
+
+        items.append({"title": title, "url": url, "snippet": snippet})
+
+    # remove duplicados por URL
+    seen = set()
+    dedup = []
+    for it in items:
+        if it["url"] in seen:
+            continue
+        seen.add(it["url"])
+        dedup.append(it)
+
+    return dedup
+
+def _fetch_article_and_describe(url):
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    desc = _extract_description_from_article_html(r.text)
+    # Também tentamos capturar um link direto para o PDF (quando a página embute)
+    pdf = None
+    m = re.search(r'href="([^"]INPDFViewer[^"]+)"', r.text)
+    if m:
+        pdf = ul.urljoin(url, m.group(1))
+    title = None
+    # título pelo <title> como fallback
+    soup = BeautifulSoup(r.text, "lxml")
+    if soup.title and soup.title.string:
+        title = _clean(soup.title.string.split(" - DOU")[0])
+    return {"title": title, "description": desc, "pdf_url": pdf, "html_url": url}
+
+def _fallback_lexml(orgao, tipo, numero, data_publicacao):
+    """
+    Fallback: consulta LexML (SRU) para pegar ementa e um link oficial.
+    """
+    # CQL: casa o tipo+numero e restringe por data (ano) e, se possível, órgão no description
+    ano = data_publicacao.split("-")[0]
+    cql = f'dc.title any "{tipo}" and dc.title any "{numero}" and date any {ano} and dc.description any "{orgao}"'
+    sru = ("https://www.lexml.gov.br/busca/SRU"
+           "?operation=searchRetrieve&version=1.2&maximumRecords=5&query=" + ul.quote(cql))
+    r = requests.get(sru, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    rec = soup.find("recorddata")
+    if not rec:
+        return None
+    title = _first_text(*(t.get_text(" ") for t in rec.find_all("dc:title")))
+    desc  = _first_text(*(d.get_text(" ") for d in rec.find_all("dc:description")))
+    # pega algum identificador/URL (às vezes há link para a publicação)
+    link  = None
+    for ident in rec.find_all("dc:identifier"):
+        val = ident.get_text(strip=True)
+        if val and ("http://" in val or "https://" in val):
+            link = val
+            break
+    return {"title": _clean(title), "description": _clean(desc), "html_url": link, "pdf_url": None}
+
+def buscar_descritivo_no_dou(orgao, tipo, numero, data_publicacao):
+    """
+    Retorna um dicionário:
+      {
+        "titulo": ...,
+        "descritivo": ...,
+        "fonte_html": ...,
+        "fonte_pdf": ... (se identificado)
+      }
+    """
+    # 1) Busca no DOU
+    try:
+        hits = _search_dou(orgao, tipo, numero, data_publicacao)
+        # filtra heurística por número/tipo no título
+        cand = None
+        for h in hits:
+            t = (h["title"] or "").lower()
+            if str(numero).lower() in t and tipo.split()[0].lower() in t:
+                cand = h
+                break
+        if not cand and hits:
+            cand = hits[0]
+
+        if cand:
+            art = _fetch_article_and_describe(cand["url"])
+            return {
+                "titulo": art["title"] or cand["title"],
+                "descritivo": art["description"],
+                "fonte_html": art["html_url"],
+                "fonte_pdf": art["pdf_url"]
+            }
+    except Exception as e:
+        # segue pro fallback
+        pass
+
+    # 2) Fallback: LexML (ementa) + eventualmente link oficial
+    alt = _fallback_lexml(orgao, tipo, numero, data_publicacao)
+    if alt:
+        return {
+            "titulo": alt["title"],
+            "descritivo": alt["description"],
+            "fonte_html": alt["html_url"],
+            "fonte_pdf": alt["pdf_url"]
+        }
+
+    return {
+        "titulo": None,
+        "descritivo": None,
+        "fonte_html": None,
+        "fonte_pdf": None
+    }
+
+# -------------- EXEMPLO DE USO --------------
+if __name__ == "__main__":
+    # Preencha aqui:
+    ORGAO  = "Banco Central do Brasil"   # ou "Conselho Monetário Nacional"
+    TIPO   = "Resolução BCB"
+    NUMERO = "277"
+    DATA   = "2022-10-31"  # YYYY-MM-DD
+
+    result = buscar_descritivo_no_dou(ORGAO, TIPO, NUMERO, DATA)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
