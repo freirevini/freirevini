@@ -1,36 +1,342 @@
----------------------------------------------------------------------------
-HTTPError                                 Traceback (most recent call last)
-Cell In[8], line 212
-    209 NUMERO = "277"
-    210 DATA   = "2022-10-31"  # YYYY-MM-DD
---> 212 result = buscar_descritivo_no_dou(ORGAO, TIPO, NUMERO, DATA)
-    213 print(json.dumps(result, ensure_ascii=False, indent=2))
+# -*- coding: utf-8 -*-
+"""
+Busca o descritivo (ementa/primeiro(s) parágrafo(s)) de um normativo a partir de:
+- órgão regulador (ex.: "Banco Central do Brasil" ou "Conselho Monetário Nacional")
+- tipo (ex.: "Resolução BCB", "Resolução CMN", "Circular", "Carta Circular")
+- número (ex.: "277")
+- data de publicação (YYYY-MM-DD)
 
-Cell In[8], line 188, in buscar_descritivo_no_dou(orgao, tipo, numero, data_publicacao)
-    185     pass
-    187 # 2) Fallback: LexML (ementa) + eventualmente link oficial
---> 188 alt = _fallback_lexml(orgao, tipo, numero, data_publicacao)
-    189 if alt:
-    190     return {
-    191         "titulo": alt["title"],
-    192         "descritivo": alt["description"],
-    193         "fonte_html": alt["html_url"],
-    194         "fonte_pdf": alt["pdf_url"]
-    195     }
+Ordem de tentativa:
+1) DOU (busca + página da matéria)
+2) BCB Exibe Normativo (se for CMN/BCB)
+3) LexML (SRU) com queries tolerantes
 
-Cell In[8], line 136, in _fallback_lexml(orgao, tipo, numero, data_publicacao)
-    133 sru = ("https://www.lexml.gov.br/busca/SRU"
-    134        "?operation=searchRetrieve&version=1.2&maximumRecords=5&query=" + ul.quote(cql))
-    135 r = requests.get(sru, headers=HEADERS, timeout=30)
---> 136 r.raise_for_status()
-    137 soup = BeautifulSoup(r.text, "lxml")
-    138 rec = soup.find("recorddata")
+Requisitos:
+pip install requests beautifulsoup4 lxml urllib3
+"""
 
-File c:\Users\vinicius.silva\AppData\Local\conda\conda\envs\py_atualizado\Lib\site-packages\requests\models.py:1024, in Response.raise_for_status(self)
-   1019     http_error_msg = (
-   1020         f"{self.status_code} Server Error: {reason} for url: {self.url}"
-   1021     )
-   1023 if http_error_msg:
--> 1024     raise HTTPError(http_error_msg, response=self)
+import re
+import json
+import time
+import urllib.parse as ul
+import requests
+from bs4 import BeautifulSoup
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
-HTTPError: 500 Server Error: Internal Server Error for url: https://www.lexml.gov.br/busca/SRU?operation=searchRetrieve&version=1.2&maximumRecords=5&query=dc.title%20any%20%22Resolu%C3%A7%C3%A3o%20BCB%22%20and%20dc.title%20any%20%22277%22%20and%20date%20any%202022%20and%20dc.description%20any%20%22Banco%20Central%20do%20Brasil%22
+DOU_SEARCH_URL = "https://www.in.gov.br/consulta/-/buscar/dou"
+BCB_EXIBE_URL = "https://www.bcb.gov.br/estabilidadefinanceira/exibenormativo"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) dou-bot/1.1",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache"
+}
+
+def make_session():
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.8,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "HEAD"])
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.headers.update(HEADERS)
+    return s
+
+def _clean(text):
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+def _extract_description_from_article_html(html):
+    soup = BeautifulSoup(html, "lxml")
+
+    # 1) JSON-LD
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                desc = data.get("description") or data.get("alternativeHeadline")
+                if desc:
+                    return _clean(desc)
+            elif isinstance(data, list):
+                for d in data:
+                    if isinstance(d, dict):
+                        desc = d.get("description") or d.get("alternativeHeadline")
+                        if desc:
+                            return _clean(desc)
+        except Exception:
+            pass
+
+    # 2) meta description
+    meta = soup.find("meta", attrs={"name": "description"})
+    if meta and meta.get("content"):
+        return _clean(meta["content"])
+
+    # 3) og:description
+    meta = soup.find("meta", property="og:description")
+    if meta and meta.get("content"):
+        return _clean(meta["content"])
+
+    # 4) primeiros <p>
+    ps = soup.select("article p, #materia p, .article-content p, .content p")
+    if ps:
+        return _clean(" ".join(_clean(p.get_text(" ")) for p in ps[:3]))
+
+    return ""
+
+def _search_dou(session, orgao, tipo, numero, data_publicacao):
+    """
+    Consulta o buscador do DOU.
+    Retorna: lista de dicts {title, url, snippet}
+    """
+    # Query principal
+    q = f"\"{tipo} {numero}\" \"{orgao}\""
+    params = {
+        "q": q,
+        "s": "todos",
+        "exactDate": data_publicacao,  # YYYY-MM-DD
+        "sortType": "0",
+        "page": "1",
+    }
+
+    try:
+        resp = session.get(DOU_SEARCH_URL, params=params, timeout=30)
+        # Não levanta exceção automática; tratamos vazio
+        if resp.status_code >= 400:
+            return []
+        soup = BeautifulSoup(resp.text, "lxml")
+        items = []
+        for a in soup.select('a[href*="/web/dou/"], a[href*="/materia/-/"]'):
+            url = ul.urljoin(DOU_SEARCH_URL, a.get("href"))
+            title = _clean(a.get_text(" "))
+            if not title:
+                continue
+            parent = a.find_parent()
+            snippet = ""
+            if parent:
+                sib_texts = " ".join(_clean(x.get_text(" ")) for x in parent.find_all("p"))
+                snippet = sib_texts[:400]
+            items.append({"title": title, "url": url, "snippet": snippet})
+
+        # alternativa: relaxar a query caso nada encontrado
+        if not items:
+            q2 = f"\"{tipo}\" {numero} \"{orgao}\""
+            params["q"] = q2
+            resp = session.get(DOU_SEARCH_URL, params=params, timeout=30)
+            if resp.status_code < 400:
+                soup = BeautifulSoup(resp.text, "lxml")
+                for a in soup.select('a[href*="/web/dou/"], a[href*="/materia/-/"]'):
+                    url = ul.urljoin(DOU_SEARCH_URL, a.get("href"))
+                    title = _clean(a.get_text(" "))
+                    if title:
+                        items.append({"title": title, "url": url, "snippet": ""})
+
+        # dedupe
+        seen, dedup = set(), []
+        for it in items:
+            if it["url"] in seen:
+                continue
+            seen.add(it["url"])
+            dedup.append(it)
+        return dedup
+    except Exception:
+        return []
+
+def _fetch_article_and_describe(session, url):
+    try:
+        r = session.get(url, timeout=30)
+        if r.status_code >= 400:
+            return None
+        desc = _extract_description_from_article_html(r.text)
+        pdf = None
+        m = re.search(r'href="([^"]INPDFViewer[^"]+)"', r.text)
+        if m:
+            pdf = ul.urljoin(url, m.group(1))
+
+        title = None
+        soup = BeautifulSoup(r.text, "lxml")
+        if soup.title and soup.title.string:
+            title = _clean(soup.title.string.split(" - DOU")[0])
+
+        return {"title": title, "description": desc, "pdf_url": pdf, "html_url": url}
+    except Exception:
+        return None
+
+def _fallback_bcb(session, tipo, numero):
+    """
+    Se o ato for do ecossistema CMN/BCB, tenta a página Exibe Normativo.
+    """
+    try:
+        # tipo precisa ir corretamente codificado (ex.: "Resolução BCB")
+        params = {"numero": str(numero), "tipo": tipo}
+        r = session.get(BCB_EXIBE_URL, params=params, timeout=30)
+        if r.status_code >= 400:
+            return None
+        soup = BeautifulSoup(r.text, "lxml")
+
+        # Tenta achar um bloco de descrição/ementa
+        # O layout varia; tentamos algumas regiões comuns:
+        desc = ""
+        # 1) meta description
+        meta = soup.find("meta", attrs={"name": "description"})
+        if meta and meta.get("content"):
+            desc = _clean(meta["content"])
+
+        # 2) trechos iniciais do corpo
+        if not desc:
+            ps = soup.select("main p, .conteudo p, article p")
+            if ps:
+                desc = _clean(" ".join(_clean(p.get_text(" ")) for p in ps[:3]))
+
+        # Links de Texto vigente/original/compilado
+        pdf = None
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            txt = _clean(a.get_text(" ").lower())
+            if "texto vigente" in txt or "texto original" in txt or href.lower().endswith(".pdf"):
+                pdf = ul.urljoin(BCB_EXIBE_URL, href)
+                break
+
+        title = None
+        if soup.title and soup.title.string:
+            title = _clean(soup.title.string)
+
+        if desc or pdf or title:
+            return {"title": title, "description": desc, "pdf_url": pdf, "html_url": r.url}
+        return None
+    except Exception:
+        return None
+
+def _fallback_lexml(session, orgao, tipo, numero, data_publicacao):
+    """
+    Tenta LexML com queries mais tolerantes e sem quebrar em caso de 500.
+    """
+    ano = (data_publicacao or "").split("-")[0] or ""
+    cql_variants = [
+        # original (pode falhar)
+        f'dc.title any "{tipo}" and dc.title any "{numero}" and date any {ano} and dc.description any "{orgao}"',
+        # relaxada 1
+        f'dc.title any "{numero}" and date any {ano}',
+        # relaxada 2
+        f'dc.title any "{tipo}" and dc.title any "{numero}"',
+        # relaxada 3 (sem ano)
+        f'dc.title any "{tipo}" and dc.title any "{numero}" and dc.description any "{orgao}"',
+    ]
+
+    SRU = "https://www.lexml.gov.br/busca/SRU"
+    for cql in cql_variants:
+        try:
+            url = f"{SRU}?operation=searchRetrieve&version=1.2&maximumRecords=5&query={ul.quote(cql)}"
+            r = session.get(url, timeout=30)
+            if r.status_code >= 400:
+                # se o servidor estiver 500, tenta a próxima variação
+                continue
+            soup = BeautifulSoup(r.text, "lxml")
+            rec = soup.find("recorddata")
+            if not rec:
+                continue
+
+            def _first(sel):
+                el = rec.find(sel)
+                return _clean(el.get_text(" ")) if el else ""
+
+            # pega primeiros elementos relevantes
+            title = ""
+            for t in rec.find_all("dc:title"):
+                title = _clean(t.get_text(" "))
+                if title:
+                    break
+
+            desc = ""
+            for d in rec.find_all("dc:description"):
+                desc = _clean(d.get_text(" "))
+                if desc:
+                    break
+
+            link = None
+            for ident in rec.find_all("dc:identifier"):
+                val = ident.get_text(strip=True)
+                if val and ("http://" in val or "https://" in val):
+                    link = val
+                    break
+
+            if title or desc or link:
+                return {"title": title, "description": desc, "html_url": link, "pdf_url": None}
+        except Exception:
+            # ignora e tenta a próxima
+            continue
+
+    return None
+
+def buscar_descritivo(orgao, tipo, numero, data_publicacao):
+    """
+    Retorna:
+    {
+      "titulo": ...,
+      "descritivo": ...,
+      "fonte_html": ...,
+      "fonte_pdf": ...
+    }
+    """
+    session = make_session()
+
+    # 1) DOU
+    hits = _search_dou(session, orgao, tipo, numero, data_publicacao)
+    cand = None
+    for h in hits:
+        t = (h["title"] or "").lower()
+        if str(numero).lower() in t:
+            cand = h
+            break
+    if not cand and hits:
+        cand = hits[0]
+
+    if cand:
+        art = _fetch_article_and_describe(session, cand["url"])
+        if art:
+            return {
+                "titulo": art["title"] or cand["title"],
+                "descritivo": art["description"],
+                "fonte_html": art["html_url"],
+                "fonte_pdf": art["pdf_url"]
+            }
+
+    # 2) BCB (se o órgão/tipo sugerirem)
+    tipo_lower = (tipo or "").lower()
+    orgao_lower = (orgao or "").lower()
+    if any(x in orgao_lower for x in ["banco central", "conselho monetário", "conselho monetario"]) \
+       or any(x in tipo_lower for x in ["resolução bcb", "resolucao bcb", "resolução cmn", "resolucao cmn", "circular", "carta circular"]):
+        b = _fallback_bcb(session, tipo, numero)
+        if b:
+            return {
+                "titulo": b.get("title"),
+                "descritivo": b.get("description"),
+                "fonte_html": b.get("html_url"),
+                "fonte_pdf": b.get("pdf_url")
+            }
+
+    # 3) LexML (tolerante, sem levantar exceção)
+    alt = _fallback_lexml(session, orgao, tipo, numero, data_publicacao)
+    if alt:
+        return {
+            "titulo": alt.get("title"),
+            "descritivo": alt.get("description"),
+            "fonte_html": alt.get("html_url"),
+            "fonte_pdf": alt.get("pdf_url")
+        }
+
+    # Nada encontrado
+    return {"titulo": None, "descritivo": None, "fonte_html": None, "fonte_pdf": None}
+
+# ------------------ EXEMPLO ------------------
+if __name__ == "__main__":
+    # Preencha com seu caso:
+    ORGAO  = "Banco Central do Brasil"   # ou "Conselho Monetário Nacional"
+    TIPO   = "Resolução BCB"
+    NUMERO = "277"
+    DATA   = "2022-10-31"  # YYYY-MM-DD
+
+    resultado = buscar_descritivo(ORGAO, TIPO, NUMERO, DATA)
+    print(json.dumps(resultado, ensure_ascii=False, indent=2))
