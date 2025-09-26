@@ -1,20 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-POC: buscar descritivo (ementa) no DOU a partir de:
-- órgão regulador (ex.: "Banco Central do Brasil" ou "Conselho Monetário Nacional")
-- tipo (ex.: "Resolução BCB", "Resolução CMN", "Circular", "Carta Circular")
-- número (ex.: "277")
-- data de publicação (YYYY-MM-DD)
-
-Fluxo:
-1) Monta uma query e consulta o buscador do DOU (in.gov.br/consulta).
-2) Abre a página do resultado e extrai título + descritivo.
-3) Fallback: consulta LexML (SRU) para obter a ementa, se o DOU não responder.
-
-Requisitos:
-pip install requests beautifulsoup4 lxml
-"""
-
 import re
 import json
 import time
