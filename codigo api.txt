@@ -1,624 +1,173 @@
-# -*- coding: utf-8 -*-
 import os
-import re
-import json
-import logging
-import pathlib
-import gc
-import datetime as dt
-from typing import List, Dict, Optional, Tuple
-
-import win32com.client as win32  # Outlook Desktop
+import time
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from dateutil import parser as dtparser
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+#from webdriver_manager.chrome import ChromeDriverManager # Removido
+from selenium.webdriver.support.ui import Select
+#from selenium.webdriver.chrome.service import Service # Removido
 
-# =========================
-# CONFIG
-# =========================
-SENDER_EMAIL = "informe@mkcompliance.com.br"
-SUBJECT_PREFIX = "[EXT] - Normativos Divulgados em "  # o assunto termina com dd/mm/yyyy
+# ==============================================
+# CONFIGURAÇÕES INICIAIS
+# ==============================================
+# Configurar diretório de download
+download_dir = r'C:\Users\vinicius.silva\Downloads\teste'  # Altere para seu caminho
+os.makedirs(download_dir, exist_ok=True)
+print(f"Diretório de download configurado: {download_dir}")
 
-# >>>>> TESTE: edite a(s) data(s) abaixo (dd/mm/yyyy) e deixe ESTA linha ativa nos testes
-SUBJECT_DATES = ["26/09/2025"]  # coloque a(s) data(s) que quer testar
+# Configurar opções do Chrome
+options = webdriver.ChromeOptions()
+prefs = {
+    "download.default_directory": download_dir,
+    "download.prompt_for_download": False,
+    "download.directory_upgrade": True,
+    #"safebrowsing.enabled": False #Removido (opcional)
+}
+options.add_experimental_option("prefs", prefs)
+print("Opções do Chrome configuradas.")
 
-# >>>>> PRODUÇÃO: comente a linha acima e DESCOMENTE esta para pegar HOJE e os 2 dias anteriores
-# SUBJECT_DATES = [(dt.datetime.today() - dt.timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, 3)]
 
-# PASTA NO OUTLOOK (regra move os e-mails para cá)
-OUTLOOK_FOLDER_PATH = r"Caixa de Entrada\Normas MK Compliance"
-# Exemplos alternativos:
-# OUTLOOK_FOLDER_PATH = r"Inbox\Normas MK Compliance"
-# OUTLOOK_FOLDER_PATH = r"seu.email@empresa.com.br\Inbox\Normas MK Compliance"
+# Iniciar navegador
+#service = Service(ChromeDriverManager().install()) # Removido
+driver = webdriver.Chrome() # Usando apenas options
+print("Navegador Chrome iniciado.")
 
-# Caminhos de arquivos/pastas locais/rede
-EXCEL_METAS = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\3_BaseMK\BaseMkNormasParaAvaliar.xlsx"
-SAVE_DIR = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook")
-LOG_CSV = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\log_baixas.csv")
-LOG_XLSX = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\log_baixas.xlsx")
-STATE_JSON = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\state.json")
+wait = WebDriverWait(driver, 25)
+action = ActionChains(driver)
 
-# Filtros opcionais (pode deixar set() para não filtrar por aqui)
-ORGAOS_ALLOW = {"BACEN", "BCB", "BANCO CENTRAL DO BRASIL", "CVM", "ANBIMA", "CMN"}
-TIPOS_ALLOW = {"INSTRUCAO NORMATIVA", "RESOLUCAO", "CIRCULAR", "CARTA CIRCULAR", "COMUNICADO", "PORTARIA"}
+# ==============================================
+# FUNÇÃO PARA OBTER ARQUIVO MAIS RECENTE
+# ==============================================
+def get_latest_file():
+    files = [os.path.join(download_dir, f) for f in os.listdir(download_dir)]
+    return max(files, key=os.path.getctime, default=None)
 
-HTTP_TIMEOUT = 45
-LOG_LEVEL = logging.DEBUG  # DEBUG para ver o que está acontecendo
+# ==============================================
+# EXECUÇÃO PRINCIPAL
+# ==============================================
+try:
+    # Abrir o site
+    driver.get("https://bv.mkcompliance.com.br/")
+    print("Site aberto.")
 
-# =========================
-# LOG
-# =========================
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
+    # ------------------------------------------
+    # PASSO 1: Login com Microsoft
+    # ------------------------------------------
+    microsoft_btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="social-microsoft"]')))
+    print("Botão de login da Microsoft encontrado.")
+    microsoft_btn.click()
+    print("Botão de login da Microsoft clicado.")
 
-# =========================
-# HELPERS
-# =========================
-def ensure_dir(p: pathlib.Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+    # Esperar redirecionamento e fazer login manual
+    wait.until(EC.url_contains("login.microsoftonline.com"))
+    print("Redirecionado para a página de login da Microsoft.")
+    input("Faça o login manualmente e pressione Enter para continuar...")
+    print("Login manual realizado.")
 
-def N(txt: str) -> str:
-    """Normaliza: sem acentos + upper + collapse espaços."""
-    import unicodedata
-    txt = str(txt or "")
-    txt = "".join(c for c in unicodedata.normalize("NFKD", txt) if not unicodedata.combining(c))
-    return re.sub(r"\s+", " ", txt.upper().strip())
+    # ------------------------------------------
+    # PASSO 2: Navegação no sistema
+    # ------------------------------------------
+    # Ativar painel esquerdo
+    action.move_to_element_with_offset(driver.find_element(By.TAG_NAME, 'body'), 0, 100).perform()
+    time.sleep(2)
+    print("Painel esquerdo ativado.")
 
-def only_digits(s: str) -> str:
-    return re.sub(r"\D", "", str(s or ""))
+    # Acessar menus
+    menu_principal = wait.until(EC.element_to_be_clickable(
+        (By.XPATH, '//*[@id="leftside-menu-container"]/div[1]/div[2]/div/div/div/ul/li[6]/a/span[1]')
+    ))
+    print("Menu principal encontrado.")
+    menu_principal.click()
+    print("Menu principal clicado.")
 
-def sanitize_filename(s: str) -> str:
-    s = re.sub(r"[^\w\-. ]", "_", s, flags=re.UNICODE)
-    s = re.sub(r"[_ ]{2,}", "_", s).strip("._ ")
-    return s[:180]
+    submenu = wait.until(EC.element_to_be_clickable(
+        (By.XPATH, '//*[@id="normappmenu"]/ul/li[5]/a')
+    ))
+    print("Submenu encontrado.")
+    submenu.click()
+    print("Submenu clicado.")
 
-def parse_date_flexible(s: str) -> Optional[dt.date]:
-    """Robusto para dd/mm/yyyy, yyyy-mm-dd, '26 de set de 2025', etc."""
-    if not s:
-        return None
-    s = str(s).strip()
-    try:
-        return dtparser.parse(s, dayfirst=True).date()
-    except Exception:
-        pass
-    m = re.search(r"(\d{1,2})\s+de\s+([a-zç\.]+)\s+de\s+(\d{4})", s, flags=re.IGNORECASE)
-    if m:
-        d = int(m.group(1))
-        mes_raw = m.group(2).replace(".", "").lower()
-        mapa = {
-            "jan":1,"janeiro":1,"fev":2,"fevereiro":2,"mar":3,"marco":3,"março":3,"abr":4,"abril":4,
-            "mai":5,"maio":5,"jun":6,"junho":6,"jul":7,"julho":7,"ago":8,"agosto":8,"set":9,"setembro":9,
-            "out":10,"outubro":10,"nov":11,"novembro":11,"dez":12,"dezembro":12
-        }
-        mes = mapa.get(mes_raw)
-        try:
-            mes = int(mes)
-        except Exception:
-            mes = 0
-        y = int(m.group(3))
-        if 1 <= mes <= 12:
-            return dt.date(y, mes, d)
-    return None
+    # ------------------------------------------
+    # PASSO 3: Selecionar relatório
+    # ------------------------------------------
+    opcao_18 = wait.until(EC.element_to_be_clickable(
+        (By.XPATH, '//*[@id="mk-form-container"]/ol/li[18]/a')
+    ))
+    print("Opção de relatório 18 encontrada.")
+    opcao_18.click()
+    print("Opção de relatório 18 clicada.")
 
-def build_expected_subjects() -> List[str]:
-    return [f"{SUBJECT_PREFIX}{d}" for d in SUBJECT_DATES]
+    # ------------------------------------------
+    # PASSO 4: Configurar filtros
+    # ------------------------------------------
 
-def load_state() -> Dict:
-    if STATE_JSON.exists():
-        try:
-            return json.loads(STATE_JSON.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    dropdown_segmentacao = wait.until(EC.element_to_be_clickable(
+        (By.XPATH, '//*[@id="mkreportsegsearch"]')
+    ))
+    print("Dropdown de segmentação encontrado.")
 
-def save_state(state: Dict) -> None:
-    ensure_dir(STATE_JSON.parent)
-    STATE_JSON.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    #Select Dropdown
+    select = Select(dropdown_segmentacao)
 
-def _read_excel_any(path: str) -> pd.DataFrame:
-    """Tenta ler com usecols; se falhar, faz fallback p/ ler tudo."""
-    try:
-        cols_to_read = ["Órgão regulador", "Tipo", "Número", "Data do Normativo"]
-        logging.debug(f"Lendo Excel com usecols={cols_to_read}")
-        return pd.read_excel(path, usecols=cols_to_read)
-    except Exception as e:
-        logging.warning(f"usecols não bateu ({e}). Lendo planilha completa…")
-        return pd.read_excel(path)
+    #Selecionar por texto visivel
+    select.select_by_visible_text("Todos os segmentos")
+    print("Opção 'Todos os segmentos' selecionada no dropdown.")
 
-def load_targets_from_excel(path: str) -> pd.DataFrame:
-    df = _read_excel_any(path)
-    logging.info(f"Planilha carregada: {df.shape[0]} linhas, colunas: {list(df.columns)}")
+    wait.until(EC.element_to_be_clickable(
+        (By.XPATH, '//*[@id="searchbutton"]')
+    )).click()
+    print("Botão de pesquisa clicado.")
 
-    colmap = {N(c): c for c in df.columns}
-    def colfind(cands: List[str]) -> Optional[str]:
-        for c in cands:
-            if N(c) in colmap:
-                return colmap[N(c)]
-        return None
+    # ------------------------------------------
+    # PASSO 5: Download do Excel
+    # ------------------------------------------
+    wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="fullReportTableSeg_wrapper"]/div[1]/div[2]/div[2]/div/button/span'))).click()
+    print("Botão de download do Excel clicado.")
 
-    col_org = colfind(["Órgão regulador","Órgão","Orgao","Orgão","Orgão Regulador","Orgao Regulador"])
-    col_tipo = colfind(["Tipo","Tipo da Norma","Espécie","Especie"])
-    col_num  = colfind(["Número","Numero","Nº","No","N.","N"])
-    col_data = colfind(["Data do Normativo","Data do Ato","Data","Publicação","Data Publicação"])
-
-    missing = [("Órgão", col_org), ("Tipo", col_tipo), ("Número", col_num), ("Data do Ato", col_data)]
-    miss = [n for n, v in missing if v is None]
-    if miss:
-        raise RuntimeError(f"Colunas ausentes na planilha: {miss}")
-
-    df2 = pd.DataFrame({
-        "ORGAO": df[col_org].astype(str),
-        "TIPO": df[col_tipo].astype(str),
-        "NUMERO": df[col_num].astype(str),
-        "DATA_ATO": df[col_data].astype(str),
-    })
-
-    df2["N_ORGAO"] = df2["ORGAO"].map(N)
-    df2["N_TIPO"]  = df2["TIPO"].map(N)
-    df2["N_NUM"]   = df2["NUMERO"].map(only_digits)
-    df2["DATA_ATO_DT"] = df2["DATA_ATO"].map(parse_date_flexible)
-
-    before = len(df2)
-    if ORGAOS_ALLOW:
-        df2 = df2[df2["N_ORGAO"].apply(lambda x: any(k in x for k in ORGAOS_ALLOW))].copy()
-    if TIPOS_ALLOW:
-        df2 = df2[df2["N_TIPO"].apply(lambda x: any(k in x for k in TIPOS_ALLOW))].copy()
-    logging.info(f"Metas após filtros: {len(df2)} (antes: {before})")
-
-    df2.reset_index(drop=True, inplace=True)
-    logging.debug(f"Exemplo metas:\n{df2.head(3)}")
-    return df2
-
-# =========================
-# EXTRAÇÃO ROBUSTA DA TABELA DO E-MAIL
-# =========================
-def html_tables_to_rows(html_body: str) -> List[Dict]:
-    """
-    Extrai linhas da(s) tabela(s) do corpo HTML do e-mail com heurísticas robustas:
-      - aceita tabela sem <th> (usa a 1ª linha como header);
-      - mapeia cabeçalhos por similaridade (Tipo, Número, Órgão, Data do Ato);
-      - escolhe a MELHOR tabela por (qtd. colunas relevantes + qtd. de linhas);
-      - limpa NBSP, <br>, etc.
-    Retorna uma lista de dicionários já com chaves canônicas: ORGAO, TIPO, NUMERO, DATA_ATO.
-    """
-    rows: List[Dict] = []
-    if not html_body:
-        return rows
-
-    soup = BeautifulSoup(html_body, "lxml")
-
-    wanted = {
-        "ORGAO": {N("Órgão"), N("Órgão regulador"), N("Orgao"), N("Orgao Regulador"), N("Orgão Regulador")},
-        "TIPO": {N("Tipo"), N("Tipo da Norma"), N("Espécie"), N("Especie")},
-        "NUMERO": {N("Número"), N("Numero"), N("Nº"), N("No"), N("N."), N("N")},
-        "DATA_ATO": {N("Data do Ato"), N("Data do Normativo"), N("Data"), N("Publicação"), N("Data Publicação")},
-        "EMENTA": {N("Ementa"), N("Assunto"), N("Resumo"), N("Descrição"), N("Descricao")},
-        "VIGENCIA": {N("Vigência"), N("Vigencia")}
-    }
-
-    def map_headers_to_keys(header_cells: List[str]) -> Dict[int, str]:
-        idx_to_key: Dict[int, str] = {}
-        for i, h in enumerate(header_cells):
-            for key, variants in wanted.items():
-                if h in variants:
-                    idx_to_key[i] = key
-                    break
-        return idx_to_key
-
-    candidates = []
-    for table in soup.find_all("table"):
-        trs = table.find_all("tr")
-        if not trs:
-            continue
-
-        ths = table.find_all("th")
-        if ths:
-            hdr = [N(th.get_text(" ", strip=True)) for th in ths]
-            idx_to_key = map_headers_to_keys(hdr)
-            data_trs = [tr for tr in trs if tr.find_all("td")]
-        else:
-            first_tds = trs[0].find_all(["td", "th"])
-            if not first_tds:
-                continue
-            hdr = [N(td.get_text(" ", strip=True)) for td in first_tds]
-            idx_to_key = map_headers_to_keys(hdr)
-            data_trs = trs[1:]
-
-        keys_present = set(idx_to_key.values())
-        if not ({"NUMERO"} <= keys_present and ({"TIPO"} & keys_present or {"ORGAO"} & keys_present)):
-            continue
-
-        table_rows: List[Dict] = []
-        for tr in data_trs:
-            tds = tr.find_all("td")
-            if not tds:
-                continue
-            row = {}
-            for idx, key in idx_to_key.items():
-                if idx < len(tds):
-                    txt = tds[idx].get_text(" ", strip=True)
-                    row[key] = txt
-            if row.get("NUMERO"):
-                table_rows.append(row)
-
-        score = (len(keys_present & {"ORGAO", "TIPO", "NUMERO", "DATA_ATO"}), len(table_rows))
-        if table_rows:
-            candidates.append((score, table_rows))
-
-    if not candidates:
-        return rows
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_rows = candidates[0][1]
-
-    for r in best_rows:
-        rows.append({
-            "ORGAO": r.get("ORGAO", ""),
-            "TIPO": r.get("TIPO", ""),
-            "NUMERO": r.get("NUMERO", ""),
-            "DATA_ATO": r.get("DATA_ATO", "")
-        })
-    return rows
-
-def norm_row(row: Dict) -> Dict:
-    def g(*keys):
-        for k in keys:
-            if k in row and row[k] is not None:
-                return str(row[k])
-        return ""
-    org = g("ORGAO","ÓRGÃO","ORGÃO","ORG")
-    tipo = g("TIPO","ESPÉCIE")
-    num  = g("NUMERO","NÚMERO","Nº","NO","N")
-    data = g("DATA_ATO","DATA","PUBLICAÇÃO")
-    return {
-        "ORGAO": org, "TIPO": tipo, "NUMERO": num, "DATA_ATO": data,
-        "N_ORGAO": N(org), "N_TIPO": N(tipo), "N_NUM": only_digits(num),
-        "DATA_ATO_DT": parse_date_flexible(data)
-    }
-
-def rows_from_message_body(html: str, plain: str) -> List[Dict]:
-    # tenta HTML; se falhar totalmente, tenta um fallback pobre no texto simples
-    rows = html_tables_to_rows(html or "")
-    if rows:
-        return [norm_row(r) for r in rows]
-    txt = (plain or "").replace("\xa0", " ")
-    pattern = re.compile(
-        r"(INSTRUÇÃO NORMATIVA|INSTRUCAO NORMATIVA|RESOLUÇÃO|RESOLUCAO|CIRCULAR|CARTA CIRCULAR|COMUNICADO|PORTARIA)"
-        r".*?(\d{3,6}).*?"
-        r"(BANCO CENTRAL DO BRASIL|BANCO CENTRAL|BCB|BACEN|CVM|ANBIMA|CMN)",
-        re.I | re.S
-    )
-    out = []
-    for m in pattern.finditer(txt):
-        out.append(norm_row({
-            "TIPO": m.group(1),
-            "NUMERO": m.group(2),
-            "ORGAO": m.group(3),
-            "DATA_ATO": ""
-        }))
-    return out
-
-# =========================
-# MATCHING (número forte + tolerância órgão/tipo)
-# =========================
-def target_matches_email_row(tgt: pd.Series, r: Dict) -> bool:
-    # número é a âncora principal (exato em dígitos)
-    if str(tgt["N_NUM"]) != str(r["N_NUM"]):
-        logging.debug(f"  [MATCH FAIL] Número: {tgt['N_NUM']} != {r['N_NUM']}")
-        return False
-
-    t_org = tgt["N_ORGAO"]; e_org = r["N_ORGAO"]
-    t_tipo = tgt["N_TIPO"];  e_tipo = r["N_TIPO"]
-
-    # órgão: aceita equivalências mais amplas
-    org_ok = any(alias in e_org for alias in [t_org, "BANCO CENTRAL", "BANCO CENTRAL DO BRASIL", "BCB", "BACEN", "CVM", "ANBIMA", "CMN"])
-    if not org_ok:
-        logging.debug(f"  [MATCH FAIL] Órgão: '{t_org}' not in '{e_org}'")
-        return False
-
-    # tipo: contém (e.g., "INSTRUÇÃO NORMATIVA BCB")
-    tipo_ok = (t_tipo in e_tipo) or (e_tipo in t_tipo)
-    if not tipo_ok:
-        # tolera pequenas diferenças: usa a primeira palavra do tipo
-        head = t_tipo.split()[0] if t_tipo else ""
-        tipo_ok = bool(head) and head in e_tipo
-    if not tipo_ok:
-        logging.debug(f"  [MATCH FAIL] Tipo: '{t_tipo}' vs '{e_tipo}'")
-        return False
-
-    return True
-
-# =========================
-# PDF helpers
-# =========================
-def find_pdf_attachments(mail, number_digits: str, tipo_norm: str) -> List[Tuple[str, object]]:
-    found = []
-    try:
-        cnt = int(getattr(mail.Attachments, "Count", 0))
-        for i in range(1, cnt + 1):
-            att = mail.Attachments.Item(i)
-            name = str(getattr(att, "FileName", "") or "")
-            if not name.lower().endswith(".pdf"):
-                continue
-            n_ok = number_digits in N(name)
-            t_ok = N(tipo_norm).split()[0] in N(name) if tipo_norm else False
-            if n_ok and t_ok:
-                found.append((name, att))
-        if not found:
-            for i in range(1, cnt + 1):
-                att = mail.Attachments.Item(i)
-                name = str(getattr(att, "FileName", "") or "")
-                if name.lower().endswith(".pdf") and number_digits in N(name):
-                    found.append((name, att))
-    except Exception as e:
-        logging.error(f"Erro ao ler anexos: {e}")
-    return found
-
-def find_pdf_links_in_body(html: str, number_digits: str) -> List[str]:
-    links = []
-    if not html:
-        return links
-    soup = BeautifulSoup(html, "lxml")
-    for a in soup.find_all("a"):
-        href = a.get("href") or ""
-        if href.lower().endswith(".pdf") and number_digits in N(href):
-            links.append(href)
-    return links
-
-def download_link(url: str, dest: pathlib.Path) -> bool:
-    try:
-        r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
-        if r.status_code >= 400:
-            return False
-        dest.write_bytes(r.content)
-        return True
-    except Exception as e:
-        logging.warning(f"Falha download {url}: {e}")
-        return False
-
-def build_output_name(orgao: str, tipo: str, numero: str, data_ato: Optional[dt.date], fallback: str) -> str:
-    d = data_ato.strftime("%Y-%m-%d") if isinstance(data_ato, dt.date) else (fallback or dt.date.today().isoformat())
-    base = f"{d}_{orgao}_{tipo}_{only_digits(numero)}.pdf"
-    return sanitize_filename(base)
-
-def already_logged(state: Dict, entry_id: str, number_digits: str) -> bool:
-    keys = state.setdefault("downloaded", [])
-    key = f"{entry_id}:{number_digits}"
-    return key in keys
-
-def mark_logged(state: Dict, entry_id: str, number_digits: str):
-    keys = state.setdefault("downloaded", [])
-    key = f"{entry_id}:{number_digits}"
-    if key not in keys:
-        keys.append(key)
-
-# =========================
-# OUTLOOK: abrir pasta por caminho
-# =========================
-def open_outlook_folder_by_path(path_str: str):
-    """Abre uma pasta do Outlook a partir de um caminho com '\'.
-    Suporta: 'Inbox\Subpasta', 'Caixa de Entrada\Subpasta',
-             ou 'Mailbox\Inbox\Subpasta' (quando há múltiplos stores)."""
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    parts = [p for p in path_str.split("\\") if p.strip()]
-    if not parts:
-        return ns.GetDefaultFolder(6)  # Inbox
-
-    # Verifica se o primeiro segmento é um mailbox (store)
-    root = None
-    first = parts[0]
-    for i in range(1, ns.Folders.Count + 1):
-        store = ns.Folders.Item(i)
-        if str(store.Name).strip().lower() == first.strip().lower():
-            root = store
-            parts = parts[1:]
+    # ------------------------------------------
+    # PASSO 6: Esperar download concluir
+    # ------------------------------------------
+    start_time = time.time()
+    print("Aguardando download do arquivo...")
+    while True:
+        latest_file = get_latest_file()
+        if latest_file and not latest_file.endswith('.crdownload'):
+            print(f"Download concluído. Arquivo: {latest_file}")
             break
+        if time.time() - start_time > 60:
+            raise TimeoutError("Tempo excedido para download")
+        time.sleep(2)
 
-    if root is None:
-        # começa na Inbox padrão
-        root = ns.GetDefaultFolder(6)
-        # se o primeiro segmento for "Inbox" ou "Caixa de Entrada", consome
-        if first.strip().lower() in ["inbox", "caixa de entrada"]:
-            parts = parts[1:]
+    # ------------------------------------------
+    # PASSO 7: Importar para DataFrame
+    # ------------------------------------------
+    df = pd.read_excel(latest_file)
+    print("\nDataFrame criado com sucesso!")
+    print(f"Total de linhas: {len(df)}")
+    print(f"Colunas: {list(df.columns)}")
 
-    folder = root
-    for p in parts:
-        folder = folder.Folders.Item(p)
-    return folder
+except Exception as e:
+    print(f"\nErro durante a execução: {str(e)}")
+    driver.save_screenshot("erro_execucao.png")
+    print("Screenshot do erro salvo como erro_execucao.png")
 
-def open_inbox():
-    logging.info(f"Abrindo pasta do Outlook: {OUTLOOK_FOLDER_PATH}")
-    return open_outlook_folder_by_path(OUTLOOK_FOLDER_PATH)
+finally:
+    driver.quit()
+    print("Navegador fechado.")
 
-def iter_candidate_messages(folder, subjects: List[str]) -> List:
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)
-    norm_subjects = {N(s) for s in subjects}
-    logging.debug(f"Assuntos esperados: {norm_subjects}")
-    out = []
-    for mail in items:
-        try:
-            subj = str(getattr(mail, "Subject", ""))
-            from_addr = str(getattr(mail, "SenderEmailAddress", "") or "")
-            norm_subj = N(subj)
-            norm_from = N(from_addr)
-            if norm_from.endswith(N(SENDER_EMAIL)) and any(ns in norm_subj for ns in norm_subjects):
-                out.append(mail)
+# ==============================================
+# TRABALHE COM O DATAFRAME (EXEMPLO)
+# ==============================================
+# Exibir primeiras linhas
+print("\nVisualização dos dados:")
+print(df.head())
 
-            rec = getattr(mail, "ReceivedTime", None)
-            now_aware = dt.datetime.now(rec.tzinfo if rec else None)
-            if isinstance(rec, dt.datetime) and (now_aware - rec).days > 15:
-                break
-        except Exception as e:
-            logging.debug(f"Ignorando item não-mensagem: {e}")
-            continue
-    return out
-
-# =========================
-# PIPELINE
-# =========================
-def main():
-    logging.info("="*20 + " INICIANDO EXECUÇÃO " + "="*20)
-    ensure_dir(SAVE_DIR)
-    ensure_dir(LOG_CSV.parent)
-
-    # 1) metas
-    logging.info(f"1. Carregando metas da planilha: {EXCEL_METAS}")
-    try:
-        metas = load_targets_from_excel(EXCEL_METAS)
-    except Exception as e:
-        logging.error(f"Falha ao ler planilha: {e}")
-        return
-    if metas.empty:
-        logging.info("Planilha de metas vazia após filtros.")
-        return
-
-    # 2) localizar mensagens
-    folder = open_inbox()
-    subjects = build_expected_subjects()
-    mails = iter_candidate_messages(folder, subjects)
-    logging.info(f"E-mails candidatos na pasta '{OUTLOOK_FOLDER_PATH}': {len(mails)}")
-    if not mails:
-        logging.warning("Nenhum e-mail candidato encontrado (verifique data de teste/assunto/pasta).")
-
-    state = load_state()
-    log_rows: List[Dict] = []
-
-    # 3) processar e-mails
-    for mail in mails:
-        try:
-            entry_id = str(getattr(mail, "EntryID", ""))
-            subj = str(getattr(mail, "Subject", ""))
-            recd = getattr(mail, "ReceivedTime", None)
-            recd_iso = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
-            html = str(getattr(mail, "HTMLBody", "") or "")
-            plain = str(getattr(mail, "Body", "") or "")
-
-            email_rows = rows_from_message_body(html, plain)
-            logging.info(f"\n--- Processando e-mail: '{subj}' (Recebido: {recd_iso}) ---")
-            if not email_rows:
-                logging.warning("Nenhuma tabela de normativos encontrada no corpo do e-mail.")
-                continue
-            logging.debug(f"Linhas na tabela do e-mail: {len(email_rows)}")
-
-            for _, tgt in metas.iterrows():
-                try:
-                    number_digits = str(tgt["N_NUM"])
-                    if already_logged(state, entry_id, number_digits):
-                        continue
-
-                    matched_row = None
-                    for r in email_rows:
-                        if target_matches_email_row(tgt, r):
-                            matched_row = r
-                            break
-                    if not matched_row:
-                        continue
-
-                    logging.info(f"  [MATCH] {tgt['ORGAO']} | {tgt['TIPO']} | {tgt['NUMERO']}")
-
-                    saved_paths = []
-                    # anexos
-                    attachments = find_pdf_attachments(mail, number_digits, str(tgt["TIPO"]))
-                    if attachments:
-                        logging.debug(f"    Anexos candidatos: {len(attachments)}")
-                        for name, att in attachments:
-                            outname = build_output_name(
-                                orgao=str(tgt["ORGAO"]),
-                                tipo=str(tgt["TIPO"]),
-                                numero=str(tgt["NUMERO"]),
-                                data_ato=tgt["DATA_ATO_DT"],
-                                fallback=recd.date().isoformat() if isinstance(recd, dt.datetime) else None
-                            )
-                            dest = SAVE_DIR / outname
-                            k = 1
-                            while dest.exists():
-                                dest = SAVE_DIR / sanitize_filename(outname.replace(".pdf", f"_{k}.pdf"))
-                                k += 1
-                            att.SaveAsFile(str(dest))
-                            logging.info(f"    -> Anexo salvo: {dest}")
-                            saved_paths.append(str(dest))
-
-                    # links no corpo
-                    if not saved_paths:
-                        links = find_pdf_links_in_body(html, number_digits)
-                        logging.debug(f"    Links PDF: {len(links)}")
-                        for url in links:
-                            outname = build_output_name(
-                                orgao=str(tgt["ORGAO"]),
-                                tipo=str(tgt["TIPO"]),
-                                numero=str(tgt["NUMERO"]),
-                                data_ato=tgt["DATA_ATO_DT"],
-                                fallback=recd.date().isoformat() if isinstance(recd, dt.datetime) else None
-                            )
-                            dest = SAVE_DIR / outname
-                            k = 1
-                            while dest.exists():
-                                dest = SAVE_DIR / sanitize_filename(outname.replace(".pdf", f"_{k}.pdf"))
-                                k += 1
-                            if download_link(url, dest):
-                                logging.info(f"    -> Link salvo: {dest}")
-                                saved_paths.append(str(dest))
-
-                    status = "BAIXADO" if saved_paths else "NAO_ENCONTRADO_PDF"
-                    if saved_paths:
-                        mark_logged(state, entry_id, number_digits)
-
-                    log_rows.append({
-                        "email_entry_id": entry_id,
-                        "email_subject": subj,
-                        "email_received": recd_iso,
-                        "meta_orgao": str(tgt["ORGAO"]),
-                        "meta_tipo": str(tgt["TIPO"]),
-                        "meta_numero": str(tgt["NUMERO"]),
-                        "meta_data_ato": str(tgt["DATA_ATO"]),
-                        "match_row_orgao": matched_row.get("ORGAO") if matched_row else None,
-                        "match_row_tipo": matched_row.get("TIPO") if matched_row else None,
-                        "match_row_numero": matched_row.get("NUMERO") if matched_row else None,
-                        "match_row_data_ato": matched_row.get("DATA_ATO") if matched_row else None,
-                        "arquivos_salvos": ";".join(saved_paths) if saved_paths else "",
-                        "status": status,
-                    })
-                except Exception as e_row:
-                    logging.error(f"Erro processando meta '{tgt}': {e_row}")
-                    continue
-        except Exception as e_mail:
-            logging.error(f"Erro processando e-mail: {e_mail}")
-            continue
-
-    # 4) persistir logs/estado
-    logging.info("\n--- Finalizando e salvando resultados ---")
-    if log_rows:
-        ensure_dir(LOG_CSV.parent)
-        df_log = pd.DataFrame(log_rows)
-
-        header = not LOG_CSV.exists()
-        df_log.to_csv(LOG_CSV, mode='a', header=header, index=False, encoding="utf-8-sig")
-
-        try:
-            if LOG_XLSX.exists():
-                df_existente = pd.read_excel(LOG_XLSX)
-                df_final_excel = pd.concat([df_existente, df_log], ignore_index=True)
-            else:
-                df_final_excel = df_log
-            df_final_excel.drop_duplicates(
-                subset=["email_entry_id","meta_orgao","meta_tipo","meta_numero"],
-                keep='last', inplace=True
-            )
-            df_final_excel.to_excel(LOG_XLSX, index=False)
-        except Exception as e:
-            logging.error(f"Falha ao escrever o log em Excel ({LOG_XLSX}): {e}")
-
-        logging.info(f"-> Log salvo em {LOG_CSV} e {LOG_XLSX} ({len(log_rows)} novas entradas).")
-    else:
-        logging.info("-> Nenhuma nova meta foi encontrada/baixada.")
-
-    gc.collect()
-    save_state(state)
-    logging.info("="*20 + " EXECUÇÃO CONCLUÍDA " + "="*20)
-
-# =========================
-# EXECUÇÃO
-# =========================
-if __name__ == "__main__":
-    main()
+# Exemplo de análise
+if not df.empty:
+    print("\nEstatísticas básicas:")
+    print(df.describe())
+else:
+    print("\nDataFrame vazio - verifique o processo de download")
