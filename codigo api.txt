@@ -1,173 +1,120 @@
-import os
-import time
+import win32com.client
+from datetime import datetime, timedelta
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-#from webdriver_manager.chrome import ChromeDriverManager # Removido
-from selenium.webdriver.support.ui import Select
-#from selenium.webdriver.chrome.service import Service # Removido
+from bs4 import BeautifulSoup
+import os
 
-# ==============================================
-# CONFIGURAÇÕES INICIAIS
-# ==============================================
-# Configurar diretório de download
-download_dir = r'C:\Users\vinicius.silva\Downloads\teste'  # Altere para seu caminho
-os.makedirs(download_dir, exist_ok=True)
-print(f"Diretório de download configurado: {download_dir}")
+# Parâmetros de filtro
+data_inicio = "01/03/2025"
+data_fim = "07/03/2025"
+remetente_filtro = "informe@mkcompliance.com.br"
+assunto_fixo = "[EXT] - Normativos Divulgados em "
 
-# Configurar opções do Chrome
-options = webdriver.ChromeOptions()
-prefs = {
-    "download.default_directory": download_dir,
-    "download.prompt_for_download": False,
-    "download.directory_upgrade": True,
-    #"safebrowsing.enabled": False #Removido (opcional)
-}
-options.add_experimental_option("prefs", prefs)
-print("Opções do Chrome configuradas.")
+# Pasta de destino (onde serão salvos o Excel e os anexos)
+pasta_destino = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook"
+arquivo_excel = os.path.join(pasta_destino, "Normativos.xlsx")
+
+# Conectar ao Outlook
+outlook = win32com.client.Dispatch("Outlook.Application")
+namespace = outlook.GetNamespace("MAPI")
+
+# Acessar a caixa de entrada (6 = olFolderInbox)
+caixa_entrada = namespace.GetDefaultFolder(6)
+
+# Converter datas para datetime (Python)
+data_inicio_dt = datetime.strptime(data_inicio, "%d/%m/%Y")
+data_fim_dt = datetime.strptime(data_fim, "%d/%m/%Y")
+
+# Formatar datas para o filtro do Outlook (MM/DD/YYYY)
+data_inicio_fmt = data_inicio_dt.strftime("%m/%d/%Y")
+data_fim_fmt = data_fim_dt.strftime("%m/%d/%Y")
+
+# Montar filtro para ReceivedTime (data de recebimento)
+filtro_data = f"[ReceivedTime] >= '{data_inicio_fmt} 00:00 AM' AND [ReceivedTime] <= '{data_fim_fmt} 11:59 PM'"
+
+# Montar filtro para Subject (data no assunto, no formato dd/mm/yyyy)
+# Aqui fazemos uma comparação de string (lexicográfica). 
+# Ex.: "[EXT] - Normativos Divulgados em 01/03/2025" até "[EXT] - Normativos Divulgados em 07/03/2025"
+assunto_inicio = assunto_fixo + data_inicio_dt.strftime("%d/%m/%Y")
+assunto_fim = assunto_fixo + data_fim_dt.strftime("%d/%m/%Y")
+filtro_assunto = f"[Subject] >= '{assunto_inicio}' AND [Subject] <= '{assunto_fim}'"
+
+# Combinar os dois filtros (ReceivedTime e Subject)
+filtro_combinado = f"({filtro_data}) AND ({filtro_assunto})"
+
+# Obter os e-mails que satisfazem o filtro
+emails = caixa_entrada.Items.Restrict(filtro_combinado)
+
+# Lista para consolidar tabelas de múltiplos e-mails
+tabelas = []
+
+# Lista para armazenar os assuntos dos e-mails identificados
+emails_identificados = []
+
+# Colunas esperadas
+colunas_desejadas = ["Tipo", "Número", "Data do Ato", "Órgão", "Ementa", "Vigência"]
+
+for email in emails:
+    # Verificar também o remetente
+    if remetente_filtro.lower() in email.SenderEmailAddress.lower():
+        # Tentar extrair a data do assunto (ex.: "Normativos Divulgados em 06/03/2025")
+        if email.Subject.startswith(assunto_fixo):
+            try:
+                data_str = email.Subject.replace(assunto_fixo, "").strip()
+                data_no_assunto = datetime.strptime(data_str, "%d/%m/%Y")
+            except ValueError:
+                # Se não conseguir processar a data do assunto, ignora
+                continue
+
+            # Verificar se a data do assunto está no intervalo desejado
+            # (Boa prática para garantir que a comparação lexicográfica não traga dados fora)
+            if data_inicio_dt <= data_no_assunto <= data_fim_dt:
+                
+                emails_identificados.append(email.Subject)
+
+                # 1) Download de todos os anexos do e-mail
+                if email.Attachments.Count > 0:
+                    for anexo in email.Attachments:
+                        anexo_path = os.path.join(pasta_destino, anexo.FileName)
+                        try:
+                            anexo.SaveAsFile(anexo_path)
+                        except Exception as e:
+                            print(f"Erro ao salvar anexo {anexo.FileName}: {e}")
+
+                # 2) Processar o HTML do corpo do e-mail para extrair a tabela
+                html_corpo = email.HTMLBody
+                soup = BeautifulSoup(html_corpo, "html.parser")
+
+                for table in soup.find_all("table"):
+                    try:
+                        # Lê a tabela com a primeira linha como cabeçalho
+                        df_list = pd.read_html(str(table), header=0)
+                    except ValueError:
+                        continue  # Caso não haja tabelas legíveis
+
+                    for df_temp in df_list:
+                        # Verifica se a tabela possui todas as colunas desejadas
+                        if set(colunas_desejadas).issubset(df_temp.columns):
+
+                            # Cria coluna "data de processamento" (data/hora do recebimento)
+                            df_temp["data de processamento"] = data_no_assunto
+
+                            # (Opcional) Manter somente as colunas desejadas + data de processamento
+                            df_temp = df_temp[colunas_desejadas + ["data de processamento"]]
+
+                            # Adiciona o DataFrame resultante à lista geral
+                            tabelas.append(df_temp)
 
 
-# Iniciar navegador
-#service = Service(ChromeDriverManager().install()) # Removido
-driver = webdriver.Chrome() # Usando apenas options
-print("Navegador Chrome iniciado.")
-
-wait = WebDriverWait(driver, 25)
-action = ActionChains(driver)
-
-# ==============================================
-# FUNÇÃO PARA OBTER ARQUIVO MAIS RECENTE
-# ==============================================
-def get_latest_file():
-    files = [os.path.join(download_dir, f) for f in os.listdir(download_dir)]
-    return max(files, key=os.path.getctime, default=None)
-
-# ==============================================
-# EXECUÇÃO PRINCIPAL
-# ==============================================
-try:
-    # Abrir o site
-    driver.get("https://bv.mkcompliance.com.br/")
-    print("Site aberto.")
-
-    # ------------------------------------------
-    # PASSO 1: Login com Microsoft
-    # ------------------------------------------
-    microsoft_btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="social-microsoft"]')))
-    print("Botão de login da Microsoft encontrado.")
-    microsoft_btn.click()
-    print("Botão de login da Microsoft clicado.")
-
-    # Esperar redirecionamento e fazer login manual
-    wait.until(EC.url_contains("login.microsoftonline.com"))
-    print("Redirecionado para a página de login da Microsoft.")
-    input("Faça o login manualmente e pressione Enter para continuar...")
-    print("Login manual realizado.")
-
-    # ------------------------------------------
-    # PASSO 2: Navegação no sistema
-    # ------------------------------------------
-    # Ativar painel esquerdo
-    action.move_to_element_with_offset(driver.find_element(By.TAG_NAME, 'body'), 0, 100).perform()
-    time.sleep(2)
-    print("Painel esquerdo ativado.")
-
-    # Acessar menus
-    menu_principal = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, '//*[@id="leftside-menu-container"]/div[1]/div[2]/div/div/div/ul/li[6]/a/span[1]')
-    ))
-    print("Menu principal encontrado.")
-    menu_principal.click()
-    print("Menu principal clicado.")
-
-    submenu = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, '//*[@id="normappmenu"]/ul/li[5]/a')
-    ))
-    print("Submenu encontrado.")
-    submenu.click()
-    print("Submenu clicado.")
-
-    # ------------------------------------------
-    # PASSO 3: Selecionar relatório
-    # ------------------------------------------
-    opcao_18 = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, '//*[@id="mk-form-container"]/ol/li[18]/a')
-    ))
-    print("Opção de relatório 18 encontrada.")
-    opcao_18.click()
-    print("Opção de relatório 18 clicada.")
-
-    # ------------------------------------------
-    # PASSO 4: Configurar filtros
-    # ------------------------------------------
-
-    dropdown_segmentacao = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, '//*[@id="mkreportsegsearch"]')
-    ))
-    print("Dropdown de segmentação encontrado.")
-
-    #Select Dropdown
-    select = Select(dropdown_segmentacao)
-
-    #Selecionar por texto visivel
-    select.select_by_visible_text("Todos os segmentos")
-    print("Opção 'Todos os segmentos' selecionada no dropdown.")
-
-    wait.until(EC.element_to_be_clickable(
-        (By.XPATH, '//*[@id="searchbutton"]')
-    )).click()
-    print("Botão de pesquisa clicado.")
-
-    # ------------------------------------------
-    # PASSO 5: Download do Excel
-    # ------------------------------------------
-    wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="fullReportTableSeg_wrapper"]/div[1]/div[2]/div[2]/div/button/span'))).click()
-    print("Botão de download do Excel clicado.")
-
-    # ------------------------------------------
-    # PASSO 6: Esperar download concluir
-    # ------------------------------------------
-    start_time = time.time()
-    print("Aguardando download do arquivo...")
-    while True:
-        latest_file = get_latest_file()
-        if latest_file and not latest_file.endswith('.crdownload'):
-            print(f"Download concluído. Arquivo: {latest_file}")
-            break
-        if time.time() - start_time > 60:
-            raise TimeoutError("Tempo excedido para download")
-        time.sleep(2)
-
-    # ------------------------------------------
-    # PASSO 7: Importar para DataFrame
-    # ------------------------------------------
-    df = pd.read_excel(latest_file)
-    print("\nDataFrame criado com sucesso!")
-    print(f"Total de linhas: {len(df)}")
-    print(f"Colunas: {list(df.columns)}")
-
-except Exception as e:
-    print(f"\nErro durante a execução: {str(e)}")
-    driver.save_screenshot("erro_execucao.png")
-    print("Screenshot do erro salvo como erro_execucao.png")
-
-finally:
-    driver.quit()
-    print("Navegador fechado.")
-
-# ==============================================
-# TRABALHE COM O DATAFRAME (EXEMPLO)
-# ==============================================
-# Exibir primeiras linhas
-print("\nVisualização dos dados:")
-print(df.head())
-
-# Exemplo de análise
-if not df.empty:
-    print("\nEstatísticas básicas:")
-    print(df.describe())
+#Print
+print("E-mails identificados:")
+for assunto in emails_identificados:
+    print(assunto)
+                            
+# 3) Consolidação e salvamento no Excel
+if tabelas:
+    df_final = pd.concat(tabelas, ignore_index=True)
+    df_final.to_excel(arquivo_excel, index=False)
+    print(f"Arquivo Excel gerado com sucesso: {arquivo_excel}")
 else:
-    print("\nDataFrame vazio - verifique o processo de download")
+    print("Nenhuma tabela encontrada nos e-mails filtrados.")
