@@ -1,275 +1,496 @@
-"""
-norma_coletor.py
-=================
+pip install --trusted-host files.pythonhosted.org --trusted-host pypi.org \
+  pywin32 beautifulsoup4 lxml pandas openpyxl python-dateutil requests
 
-Este módulo implementa uma forma de buscar e extrair o texto
-completo de normas publicadas no Diário Oficial da União (DOU) a partir de
-informações básicas do ato normativo: órgão regulador, tipo, número e data
-de publicação.
 
-A estratégia adotada consiste em:
-
-1. Consultar o mecanismo de busca do DOU para localizar a página da
-   publicação oficial com base nos termos fornecidos (tipo, número e órgão).
-2. Abrir a página da matéria e capturar o link para o PDF oficial através
-   do endpoint ``INPDFViewer`` que a Imprensa Nacional utiliza para
-   disponibilizar os documentos.
-3. Baixar o PDF com uma sessão ``requests`` configurada e extrair o texto
-   integral usando ``PyPDF2``. Caso a extração falhe em alguma página,
-   simplesmente retorna uma string vazia para aquela página.
-
-Para usar este módulo você precisa instalar as seguintes dependências:
-
-```
-pip install requests beautifulsoup4 PyPDF2 pandas
-```
-
-Exemplo de uso:
-
-.. code-block:: python
-
-    from norma_coletor import coletar_normas
-
-    parametros = [
-        {
-            "orgao": "Banco Central do Brasil",
-            "tipo": "Resolução BCB",
-            "numero": "277",
-            "data": "2022-12-31",
-        },
-        {
-            "orgao": "Conselho Monetário Nacional",
-            "tipo": "Resolução CMN",
-            "numero": "4958",
-            "data": "2021-11-25",
-        },
-    ]
-    df = coletar_normas(parametros)
-    print(df[["órgão regulador", "tipo", "numero", "Texto completo da norma"]].head())
-
-``coletar_normas`` retornará um ``pandas.DataFrame`` contendo, além
-dos campos fornecidos, o texto completo da norma e o link do PDF de
-origem. Caso não seja possível localizar a norma ou baixar o documento,
-esses campos aparecerão como ``None``.
-"""
-
-import io
+# -*- coding: utf-8 -*-
+import os
 import re
-from dataclasses import dataclass
-from typing import List, Dict, Optional
+import io
+import csv
+import json
+import time
+import glob
+import hashlib
+import logging
+import pathlib
+import datetime as dt
+from typing import List, Dict, Optional, Tuple
 
-import pandas as pd  # type: ignore
+import win32com.client as win32  # Outlook Desktop
+import pandas as pd
 import requests
-from bs4 import BeautifulSoup  # type: ignore
-from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+from dateutil import parser as dtparser
 
-# Tentamos importar bibliotecas de extração de PDF. Se nenhuma delas
-# estiver instalada, a extração de texto será desativada (texto retorna ``None``).
-try:
-    from PyPDF2 import PdfReader  # type: ignore
+# =========================
+# CONFIG
+# =========================
+SENDER_EMAIL = "informe@mkcompliance.com.br"
+SUBJECT_PREFIX = "[EXT] - Normativos Divulgados em "  # o assunto termina com dd/mm/yyyy
 
-    def _extract_text_from_pdf_bytes_impl(pdf_bytes: bytes) -> str:
-        """Extrai texto de PDF utilizando PyPDF2.
+# >>>>> TESTE: edite a(s) data(s) abaixo (dd/mm/yyyy) e deixe ESTA linha ativa nos testes
+SUBJECT_DATES = ["29/09/2025"]  # coloque a(s) data(s) que quer testar
 
-        Percorre todas as páginas retornando o texto concatenado. Caso
-        ocorra alguma falha em uma página específica, ignora e segue.
-        """
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        texts: List[str] = []
-        for page in reader.pages:
-            try:
-                txt = page.extract_text()
-            except Exception:
-                txt = ""
-            if txt:
-                texts.append(txt)
-        return "\n".join(texts)
-except Exception:
+# >>>>> PRODUÇÃO: comente a linha de cima e DESCOMENTE esta para pegar HOJE e os 2 dias anteriores
+# SUBJECT_DATES = [(dt.datetime.today() - dt.timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, 3)]
+
+# Caminhos
+EXCEL_METAS = r"C:\Normas\entrada\metas_normas.xlsx"           # planilha com as metas (Órgão, Tipo, Número, Data do Ato)
+SAVE_DIR = pathlib.Path(r"\\SEU-SERVIDOR\pasta\Normas\PDFs")   # pasta de rede de destino dos PDFs
+LOG_CSV = pathlib.Path(r"C:\Normas\saida\log_baixas.csv")
+LOG_XLSX = pathlib.Path(r"C:\Normas\saida\log_baixas.xlsx")
+STATE_JSON = pathlib.Path(r"C:\Normas\saida\state.json")
+
+# Opcional: filtros adicionais por órgão/tipo (todos normalizados/sem acento/upper).
+# Deixe vazios para aceitar qualquer órgão/tipo da planilha.
+ORGAOS_ALLOW = {"BACEN", "BCB", "BANCO CENTRAL DO BRASIL", "CVM", "ANBIMA", "CMN"}
+TIPOS_ALLOW = {"INSTRUCAO NORMATIVA", "RESOLUCAO", "CIRCULAR", "CARTA CIRCULAR", "COMUNICADO", "PORTARIA"}
+
+HTTP_TIMEOUT = 45  # s para download de PDF por link
+LOG_LEVEL = logging.INFO
+
+# =========================
+# LOG
+# =========================
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+# =========================
+# HELPERS
+# =========================
+def ensure_dir(p: pathlib.Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def N(txt: str) -> str:
+    """Normaliza: sem acentos + upper + collapse espaços."""
+    import unicodedata
+    txt = str(txt or "")
+    txt = "".join(c for c in unicodedata.normalize("NFKD", txt) if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", txt.upper().strip())
+
+def only_digits(s: str) -> str:
+    return re.sub(r"\D", "", str(s or ""))
+
+def sanitize_filename(s: str) -> str:
+    s = re.sub(r"[^\w\-. ]", "_", s, flags=re.UNICODE)
+    s = re.sub(r"[_ ]{2,}", "_", s).strip("._ ")
+    return s[:180]
+
+def parse_date_flexible(s: str) -> Optional[dt.date]:
+    if not s:
+        return None
+    s = str(s).strip()
+    # dd/mm/yyyy ou yyyy-mm-dd resolvem direto:
     try:
-        # Tenta utilizar pdfminer.six como fallback
-        from pdfminer.high_level import extract_text  # type: ignore
-
-        def _extract_text_from_pdf_bytes_impl(pdf_bytes: bytes) -> str:
-            """Extrai texto de PDF utilizando pdfminer.six.
-
-            A função escreve os bytes em um ``BytesIO`` e usa o helper
-            ``extract_text``. É mais lenta que PyPDF2, mas tolerante.
-            """
-            with io.BytesIO(pdf_bytes) as fp:
-                return extract_text(fp) or ""
+        # tenta dayfirst
+        return dtparser.parse(s, dayfirst=True).date()
     except Exception:
-        # Nenhuma biblioteca de PDF disponível
-        def _extract_text_from_pdf_bytes_impl(pdf_bytes: bytes) -> str:
-            return ""
-
-
-class NormaColetor:
-    """Classe responsável por pesquisar e extrair normas completas do DOU.
-
-    A classe encapsula uma sessão HTTP com ``requests`` configurada com
-    cabeçalhos adequados (``User-Agent`` e ``Accept-Language``) e oferece
-    métodos auxiliares para busca no DOU, extração de links de PDF e
-    download/extração do texto.
-    """
-
-    def __init__(self) -> None:
-        # Configura a sessão para reutilizar conexões e incluir cabeçalhos
-        self.session: requests.Session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (NormaColetor/1.0; +https://example.org)",
-            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
-        })
-
-    def _search_dou(self, orgao: str, tipo: str, numero: str, data_publicacao: str) -> List[Dict[str, str]]:
-        """Busca na página de consulta do DOU pelas normas informadas.
-
-        Os parâmetros são concatenados em uma consulta entre aspas para
-        aumentar a precisão do buscador. A função retorna uma lista de
-        dicionários contendo o título e a URL de cada resultado.
-        """
-        query = f'"{tipo} {numero}" "{orgao}"'
-        params = {
-            "q": query,
-            "s": "todos",
-            "exactDate": data_publicacao,
-            "sortType": "0",
-            "page": "1",
+        pass
+    # "26 de set de 2025" / "30 de agosto de 2024"
+    m = re.search(r"(\d{1,2})\s+de\s+([a-zç\.]+)\s+de\s+(\d{4})", s, flags=re.IGNORECASE)
+    if m:
+        d = int(m.group(1))
+        mes_raw = m.group(2).replace(".", "").lower()
+        mapa = {
+            "jan":1,"janeiro":1,"fev":2,"fevereiro":2,"mar":3,"marco":"3","março":3,"abr":4,"abril":4,
+            "mai":5,"maio":5,"jun":6,"junho":6,"jul":7,"julho":7,"ago":8,"agosto":8,"set":9,"setembro":9,
+            "out":10,"outubro":10,"nov":11,"novembro":11,"dez":12,"dezembro":12
         }
-        url = "https://www.in.gov.br/consulta/-/buscar/dou"
-        try:
-            resp = self.session.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-        except Exception:
-            return []
-        soup = BeautifulSoup(resp.text, "lxml")
-        items: List[Dict[str, str]] = []
-        for a in soup.select('a[href*="/web/dou/"], a[href*="/materia/-/"]'):
-            href = a.get("href")
-            title = a.get_text().strip()
-            if not href:
-                continue
-            full_url = urljoin(url, href)
-            items.append({"url": full_url, "title": title})
-        # Remove duplicados preservando ordem
-        seen: set = set()
-        dedup: List[Dict[str, str]] = []
-        for it in items:
-            if it["url"] in seen:
-                continue
-            seen.add(it["url"])
-            dedup.append(it)
-        return dedup
+        mes = int(mapa.get(mes_raw, 0)) if isinstance(mapa.get(mes_raw, 0), int) else int(mapa.get(mes_raw, "0"))
+        y = int(m.group(3))
+        if 1 <= mes <= 12:
+            return dt.date(y, mes, d)
+    return None
 
-    def _extract_pdf_url_from_article(self, article_url: str) -> Optional[str]:
-        """Extrai o link para o PDF oficial a partir da página da matéria.
+def date_to_ddmmyyyy(d: dt.date) -> str:
+    return d.strftime("%d/%m/%Y")
 
-        A página de matérias do DOU contém, em seu HTML, um link para o
-        serviço ``INPDFViewer``. Este método busca esse link e retorna a
-        URL absoluta. Caso não encontre, retorna ``None``.
-        """
+def build_expected_subjects() -> List[str]:
+    return [f"{SUBJECT_PREFIX}{d}" for d in SUBJECT_DATES]
+
+def load_state() -> Dict:
+    if STATE_JSON.exists():
         try:
-            resp = self.session.get(article_url, timeout=30)
-            # se a página retornar erro, aborta
-            if resp.status_code >= 400:
-                return None
-            # Procura por um link contendo "INPDFViewer"
-            m = re.search(r'href="([^"]*INPDFViewer[^"]*)"', resp.text)
-            if m:
-                pdf_url = urljoin(article_url, m.group(1))
-                return pdf_url
+            return json.loads(STATE_JSON.read_text(encoding="utf-8"))
         except Exception:
-            return None
+            return {}
+    return {}
+
+def save_state(state: Dict) -> None:
+    ensure_dir(STATE_JSON.parent)
+    STATE_JSON.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def load_targets_from_excel(path: str) -> pd.DataFrame:
+    """
+    Lê a planilha de metas e normaliza colunas:
+      Órgão | Tipo | Número | Data do Ato
+    Aceita variantes de cabeçalho.
+    """
+    df = pd.read_excel(path)
+    # normaliza nomes das colunas
+    colmap = {N(c): c for c in df.columns}
+    def colfind(cands: List[str]) -> Optional[str]:
+        for c in cands:
+            if N(c) in colmap:
+                return colmap[N(c)]
         return None
 
-    def _download_pdf(self, pdf_url: str) -> Optional[bytes]:
-        """Baixa o PDF indicado pelo link.
+    col_org = colfind(["Órgão", "Orgao", "Orgão", "Orgão Regulador", "Orgao Regulador"])
+    col_tipo = colfind(["Tipo", "Tipo da Norma", "Espécie", "Especie"])
+    col_num  = colfind(["Número", "Numero", "Nº", "No", "N."])
+    col_data = colfind(["Data do Ato", "Data", "Publicação", "Data Publicação"])
 
-        Retorna o conteúdo binário do PDF ou ``None`` em caso de erro.
-        """
-        try:
-            resp = self.session.get(pdf_url, timeout=60)
-            resp.raise_for_status()
-            return resp.content
-        except Exception:
-            return None
+    missing = [("Órgão", col_org), ("Tipo", col_tipo), ("Número", col_num), ("Data do Ato", col_data)]
+    miss = [n for n, v in missing if v is None]
+    if miss:
+        raise RuntimeError(f"Colunas ausentes na planilha: {miss}")
 
-    def _extract_text_from_pdf_bytes(self, pdf_bytes: bytes) -> str:
-        """Extrai texto de um PDF a partir de seu conteúdo em bytes.
+    df2 = pd.DataFrame({
+        "ORGAO": df[col_org].astype(str),
+        "TIPO": df[col_tipo].astype(str),
+        "NUMERO": df[col_num].astype(str),
+        "DATA_ATO": df[col_data].astype(str),
+    })
 
-        Se uma biblioteca de extração estiver disponível (PyPDF2 ou
-        pdfminer.six), ela será utilizada. Caso contrário, retorna uma
-        string vazia, indicando que o texto não pôde ser extraído.
-        """
-        return _extract_text_from_pdf_bytes_impl(pdf_bytes)
+    # normalizados
+    df2["N_ORGAO"] = df2["ORGAO"].map(N)
+    df2["N_TIPO"]  = df2["TIPO"].map(N)
+    df2["N_NUM"]   = df2["NUMERO"].map(lambda x: only_digits(x))
+    df2["DATA_ATO_DT"] = df2["DATA_ATO"].map(parse_date_flexible)
 
-    def _find_pdf_url(self, orgao: str, tipo: str, numero: str, data: str) -> Optional[str]:
-        """Executa a busca e retorna o primeiro link de PDF encontrado.
+    # filtros (opcionais)
+    if ORGAOS_ALLOW:
+        df2 = df2[df2["N_ORGAO"].apply(lambda x: any(k in x for k in ORGAOS_ALLOW))].copy()
+    if TIPOS_ALLOW:
+        df2 = df2[df2["N_TIPO"].apply(lambda x: any(k in x for k in TIPOS_ALLOW))].copy()
 
-        A função prioriza resultados cujo título contenha explicitamente o
-        número da norma. Caso não encontre, tenta o primeiro resultado
-        retornado.
-        """
-        hits = self._search_dou(orgao, tipo, numero, data)
-        pdf_url: Optional[str] = None
-        for h in hits:
-            if str(numero).lower() in h["title"].lower():
-                pdf_url = self._extract_pdf_url_from_article(h["url"])
-                if pdf_url:
-                    break
-        if not pdf_url and hits:
-            pdf_url = self._extract_pdf_url_from_article(hits[0]["url"])
-        return pdf_url
+    df2.reset_index(drop=True, inplace=True)
+    return df2
 
-    def coletar_norma(self, orgao: str, tipo: str, numero: str, data: str) -> Dict[str, Optional[str]]:
-        """Pesquisa uma norma e retorna metadados e texto completo.
+def html_tables_to_rows(html: str) -> List[Dict]:
+    """Extrai linhas de todas as tabelas do HTML."""
+    rows: List[Dict] = []
+    if not html:
+        return rows
 
-        Os parâmetros correspondem à ementa da norma. O retorno é um
-        dicionário contendo todos os campos solicitados na tabela:
+    # 1) pandas.read_html
+    try:
+        dfs = pd.read_html(html)
+    except ValueError:
+        dfs = []
 
-        - ``órgão regulador``
-        - ``tipo``
-        - ``numero``
-        - ``data de publicação``
-        - ``Texto completo da norma``
-        - ``fonte_pdf`` (link para o PDF)
-        """
-        pdf_url = self._find_pdf_url(orgao, tipo, numero, data)
-        full_text: Optional[str] = None
-        if pdf_url:
-            pdf_bytes = self._download_pdf(pdf_url)
-            if pdf_bytes:
-                try:
-                    full_text = self._extract_text_from_pdf_bytes(pdf_bytes)
-                except Exception:
-                    # Falha ao extrair texto; mantém None
-                    full_text = None
-        return {
-            "órgão regulador": orgao,
-            "tipo": tipo,
-            "numero": numero,
-            "data de publicação": data,
-            "Texto completo da norma": full_text,
-            "fonte_pdf": pdf_url,
+    def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+        hm = {
+            "ORGAO": {"ÓRGÃO","ORGAO","ORGÃO","ÓRGÃO REGULADOR","ORGAO REGULADOR","ORG"},
+            "TIPO": {"TIPO","TIPO DA NORMA","ESPÉCIE","ESPECIE"},
+            "NUMERO": {"NÚMERO","NUMERO","Nº","N.","NO","N"},
+            "DATA_ATO": {"DATA DO ATO","DATA","PUBLICAÇÃO","PUBLICACAO","DATA DA PUBLICAÇÃO"},
+            "EMENTA": {"EMENTA","ASSUNTO","RESUMO","DESCRIÇÃO","DESCRICAO"},
+            "LINK": {"LINK","URL","PDF","ARQUIVO"}
         }
+        newcols = []
+        for c in df.columns:
+            cn = N(str(c))
+            mapped = None
+            for k, variants in hm.items():
+                if cn in {N(v) for v in variants}:
+                    mapped = k; break
+            newcols.append(mapped or cn)
+        df.columns = newcols
+        return df
 
+    for df in dfs:
+        df = normalize_headers(df)
+        for _, r in df.iterrows():
+            rows.append({k: (None if pd.isna(v) else str(v)) for k, v in r.to_dict().items()})
 
-def coletar_normas(lista_parametros: List[Dict[str, str]]) -> pd.DataFrame:
-    """Coleta uma lista de normas e retorna um DataFrame com os resultados.
+    # 2) fallback BS4 <table>
+    if not rows:
+        soup = BeautifulSoup(html, "lxml")
+        for table in soup.select("table"):
+            # cabeçalho
+            headers = []
+            ths = table.select("thead th")
+            if not ths:
+                ths = table.select("tr th")
+            if ths:
+                headers = [N(th.get_text(" ", strip=True)) for th in ths]
+            for tr in table.select("tr"):
+                tds = tr.find_all("td")
+                if not tds: continue
+                vals = [td.get_text(" ", strip=True) for td in tds]
+                if headers and len(headers) == len(vals):
+                    row = {headers[i]: vals[i] for i in range(len(vals))}
+                else:
+                    row = {f"C{i+1}": v for i, v in enumerate(vals)}
+                rows.append(row)
 
-    ``lista_parametros`` deve conter dicionários com as chaves ``orgao``,
-    ``tipo``, ``numero`` e ``data`` (no formato YYYY-MM-DD). O retorno
-    é um DataFrame com as colunas especificadas na requisição.
-    """
-    coletor = NormaColetor()
-    linhas: List[Dict[str, Optional[str]]] = []
-    for params in lista_parametros:
-        linhas.append(coletor.coletar_norma(
-            orgao=params.get("orgao", ""),
-            tipo=params.get("tipo", ""),
-            numero=params.get("numero", ""),
-            data=params.get("data", ""),
-        ))
-    return pd.DataFrame(linhas)
+    return rows
 
+def norm_row(row: Dict) -> Dict:
+    """Normaliza uma linha vinda do HTML do e-mail."""
+    def g(*keys):
+        for k in keys:
+            if k in row and row[k] is not None:
+                return str(row[k])
+        return ""
+    org = g("ORGAO","ÓRGÃO","ORGÃO","ORG")
+    tipo = g("TIPO","ESPÉCIE")
+    num  = g("NUMERO","NÚMERO","Nº","NO","N")
+    data = g("DATA_ATO","DATA","PUBLICAÇÃO")
+    return {
+        "ORGAO": org, "TIPO": tipo, "NUMERO": num, "DATA_ATO": data,
+        "N_ORGAO": N(org), "N_TIPO": N(tipo), "N_NUM": only_digits(num),
+        "DATA_ATO_DT": parse_date_flexible(data)
+    }
 
-__all__ = ["NormaColetor", "coletar_normas"]
+def rows_from_message_body(html: str, plain: str) -> List[Dict]:
+    rows = html_tables_to_rows(html or plain or "")
+    return [norm_row(r) for r in rows if r]
+
+def target_matches_email_row(tgt: pd.Series, r: Dict]) -> bool:
+    """Compara meta (planilha) com linha do e-mail (normalizada)."""
+    # Número: exato em dígitos
+    if str(tgt["N_NUM"]) != str(r["N_NUM"]):
+        return False
+    # Órgão: contém (permite “BANCO CENTRAL DO BRASIL” vs “BACEN”)
+    if not any(k in r["N_ORGAO"] for k in [tgt["N_ORGAO"], "BACEN","BCB","BANCO CENTRAL"]):
+        return False
+    # Tipo: contém (INSTRUÇÃO NORMATIVA pode aparecer “INSTRUÇÃO NORMATIVA BCB”)
+    if not (tgt["N_TIPO"] in r["N_TIPO"] or r["N_TIPO"] in tgt["N_TIPO"]):
+        return False
+    # Data do ato: igualdade tolerante (até +/- 2 dias se parse ok)
+    td, rd = tgt["DATA_ATO_DT"], r["DATA_ATO_DT"]
+    if td and rd:
+        return abs((td - rd).days) <= 2
+    # se não deu pra parsear, aceita
+    return True
+
+def find_pdf_attachments(mail, number_digits: str, tipo_norm: str) -> List[Tuple[str, bytes]]:
+    """Seleciona anexos PDF cujo nome bate com o número e (preferencial) com o tipo."""
+    found = []
+    for att in list(mail.Attachments):
+        name = str(att.FileName or "")
+        if not name.lower().endswith(".pdf"):
+            continue
+        n_ok = number_digits in N(name)
+        t_ok = N(tipo_norm).split()[0] in N(name)  # primeira palavra do tipo
+        if n_ok and t_ok:
+            found.append((name, att))
+    # fallback: só por número
+    if not found:
+        for att in list(mail.Attachments):
+            name = str(att.FileName or "")
+            if name.lower().endswith(".pdf") and number_digits in N(name):
+                found.append((name, att))
+    # baixa bytes só quando for salvar (aqui retorna o objeto)
+    return found
+
+def find_pdf_links_in_body(html: str, number_digits: str) -> List[str]:
+    links = []
+    if not html:
+        return links
+    soup = BeautifulSoup(html, "lxml")
+    for a in soup.find_all("a"):
+        href = a.get("href") or ""
+        if href.lower().endswith(".pdf") and number_digits in N(href):
+            links.append(href)
+    return links
+
+def download_link(url: str, dest: pathlib.Path) -> bool:
+    try:
+        r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        if r.status_code >= 400: return False
+        dest.write_bytes(r.content)
+        return True
+    except Exception as e:
+        logging.warning(f"Falha download {url}: {e}")
+        return False
+
+def build_output_name(orgao: str, tipo: str, numero: str, data_ato: Optional[dt.date], fallback: str) -> str:
+    d = data_ato.strftime("%Y-%m-%d") if isinstance(data_ato, dt.date) else (fallback or dt.date.today().isoformat())
+    base = f"{d}_{orgao}_{tipo}_{only_digits(numero)}.pdf"
+    return sanitize_filename(base)
+
+def already_logged(state: Dict, entry_id: str, number_digits: str) -> bool:
+    keys = state.setdefault("downloaded", [])
+    key = f"{entry_id}:{number_digits}"
+    return key in keys
+
+def mark_logged(state: Dict, entry_id: str, number_digits: str):
+    keys = state.setdefault("downloaded", [])
+    key = f"{entry_id}:{number_digits}"
+    if key not in keys:
+        keys.append(key)
+
+# =========================
+# OUTLOOK
+# =========================
+def open_inbox():
+    outlook = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    inbox = outlook.GetDefaultFolder(6)  # 6 = Inbox
+    return inbox
+
+def iter_candidate_messages(inbox, subjects: List[str]) -> List:
+    """Percorre do mais novo ao mais antigo e retorna só os que batem remetente + assunto esperado."""
+    items = inbox.Items
+    items.Sort("[ReceivedTime]", True)
+    subjects_set = {N(s) for s in subjects}
+    out = []
+    for mail in items:
+        try:
+            subj = str(getattr(mail, "Subject", ""))
+            from_addr = str(getattr(mail, "SenderEmailAddress", "") or "")
+            if N(from_addr).endswith(N(SENDER_EMAIL)) and N(f"{SUBJECT_PREFIX}") in N(subj):
+                # confere se a data do assunto é uma das desejadas
+                if N(subj) in subjects_set:
+                    out.append(mail)
+                else:
+                    # alguns Outlooks incluem prefixos; confere se termina com a data alvo
+                    ends_ok = any(N(subj).endswith(N(d)) for d in subjects)
+                    if ends_ok:
+                        out.append(mail)
+            # early stop (se passou de 15 dias atrás, pare)
+            rec = getattr(mail, "ReceivedTime", None)
+            if isinstance(rec, dt.datetime) and (dt.datetime.now() - rec).days > 15:
+                break
+        except Exception:
+            continue
+    return out
+
+# =========================
+# PIPELINE
+# =========================
+def main():
+    ensure_dir(SAVE_DIR)
+    ensure_dir(LOG_CSV.parent)
+
+    # 1) metas
+    metas = load_targets_from_excel(EXCEL_METAS)
+    if metas.empty:
+        logging.info("Planilha de metas vazia após filtros.")
+        return
+
+    # 2) Outlook: localizar mensagens candidatas
+    inbox = open_inbox()
+    subjects = build_expected_subjects()
+    mails = iter_candidate_messages(inbox, subjects)
+    logging.info(f"E-mails candidatos: {len(mails)}")
+
+    state = load_state()
+    log_rows: List[Dict] = []
+
+    # 3) para cada e-mail, extrair tabela e cruzar
+    for mail in mails:
+        entry_id = str(getattr(mail, "EntryID", ""))
+        subj = str(getattr(mail, "Subject", ""))
+        recd = getattr(mail, "ReceivedTime", None)
+        recd_iso = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
+        html = str(getattr(mail, "HTMLBody", "") or "")
+        plain = str(getattr(mail, "Body", "") or "")
+
+        email_rows = rows_from_message_body(html, plain)
+        if not email_rows:
+            logging.info(f"Sem tabela no e-mail: {subj}")
+            continue
+
+        # 4) tentar cada meta contra as linhas do e-mail
+        for i, tgt in metas.iterrows():
+            number_digits = str(tgt["N_NUM"])
+
+            # pular se já baixado este número para este e-mail
+            if already_logged(state, entry_id, number_digits):
+                continue
+
+            # match em uma das linhas do e-mail
+            matched_row = None
+            for r in email_rows:
+                if target_matches_email_row(tgt, r):
+                    matched_row = r
+                    break
+            if not matched_row:
+                continue  # esta meta não aparece neste e-mail
+
+            # 5) procurar PDF — anexos primeiro
+            attachments = find_pdf_attachments(mail, number_digits, str(tgt["TIPO"]))
+            saved_paths = []
+
+            if attachments:
+                for name, att in attachments:
+                    outname = build_output_name(
+                        orgao=str(tgt["ORGAO"]),
+                        tipo=str(tgt["TIPO"]),
+                        numero=str(tgt["NUMERO"]),
+                        data_ato=tgt["DATA_ATO_DT"],
+                        fallback=recd.date().isoformat() if isinstance(recd, dt.datetime) else None
+                    )
+                    dest = SAVE_DIR / outname
+                    k = 1
+                    while dest.exists():
+                        dest = SAVE_DIR / sanitize_filename(outname.replace(".pdf", f"_{k}.pdf"))
+                        k += 1
+                    att.SaveAsFile(str(dest))
+                    saved_paths.append(str(dest))
+
+            # 6) se não teve anexo, procurar link .pdf no corpo
+            if not saved_paths:
+                links = find_pdf_links_in_body(html, number_digits)
+                for url in links:
+                    outname = build_output_name(
+                        orgao=str(tgt["ORGAO"]),
+                        tipo=str(tgt["TIPO"]),
+                        numero=str(tgt["NUMERO"]),
+                        data_ato=tgt["DATA_ATO_DT"],
+                        fallback=recd.date().isoformat() if isinstance(recd, dt.datetime) else None
+                    )
+                    dest = SAVE_DIR / outname
+                    k = 1
+                    while dest.exists():
+                        dest = SAVE_DIR / sanitize_filename(outname.replace(".pdf", f"_{k}.pdf"))
+                        k += 1
+                    if download_link(url, dest):
+                        saved_paths.append(str(dest))
+
+            status = "BAIXADO" if saved_paths else "NAO_ENCONTRADO_PDF"
+
+            if saved_paths:
+                mark_logged(state, entry_id, number_digits)
+
+            # 7) log
+            log_rows.append({
+                "email_entry_id": entry_id,
+                "email_subject": subj,
+                "email_received": recd_iso,
+                "meta_orgao": str(tgt["ORGAO"]),
+                "meta_tipo": str(tgt["TIPO"]),
+                "meta_numero": str(tgt["NUMERO"]),
+                "meta_data_ato": str(tgt["DATA_ATO"]),
+                "match_row_orgao": matched_row.get("ORGAO") if matched_row else None,
+                "match_row_tipo": matched_row.get("TIPO") if matched_row else None,
+                "match_row_numero": matched_row.get("NUMERO") if matched_row else None,
+                "match_row_data_ato": matched_row.get("DATA_ATO") if matched_row else None,
+                "arquivos_salvos": ";".join(saved_paths) if saved_paths else "",
+                "status": status,
+            })
+
+    # 8) persistir logs e estado
+    if log_rows:
+        ensure_dir(LOG_CSV.parent)
+        df_log = pd.DataFrame(log_rows)
+        if LOG_CSV.exists():
+            df_old = pd.read_csv(LOG_CSV)
+            df_log = pd.concat([df_old, df_log], ignore_index=True)
+        df_log.to_csv(LOG_CSV, index=False, encoding="utf-8-sig")
+        df_log.to_excel(LOG_XLSX, index=False)
+        logging.info(f"Log salvo em {LOG_CSV} e {LOG_XLSX} (linhas novas: {len(log_rows)})")
+    else:
+        logging.info("Nenhuma meta foi encontrada nos e-mails candidatos.")
+
+    save_state(state)
+    logging.info("Concluído.")
+
+# =========================
+# EXECUÇÃO
+# =========================
+if __name__ == "__main__":
+    main()
