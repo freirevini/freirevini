@@ -169,58 +169,95 @@ def load_targets_from_excel(path: str) -> pd.DataFrame:
     logging.debug(f"Exemplo metas:\n{df2.head(3)}")
     return df2
 
+# =========================
+# EXTRAÇÃO ROBUSTA DA TABELA DO E-MAIL
+# =========================
 def html_tables_to_rows(html_body: str) -> List[Dict]:
     """
-    Extrai linhas de tabelas de um corpo de e-mail HTML usando BeautifulSoup.
-    Esta abordagem é mais robusta que pd.read_html para HTMLs de e-mail.
+    Extrai linhas da(s) tabela(s) do corpo HTML do e-mail com heurísticas robustas:
+      - aceita tabela sem <th> (usa a 1ª linha como header);
+      - mapeia cabeçalhos por similaridade (Tipo, Número, Órgão, Data do Ato);
+      - escolhe a MELHOR tabela por (qtd. colunas relevantes + qtd. de linhas);
+      - limpa NBSP, <br>, etc.
+    Retorna uma lista de dicionários já com chaves canônicas: ORGAO, TIPO, NUMERO, DATA_ATO.
     """
     rows: List[Dict] = []
     if not html_body:
         return rows
 
     soup = BeautifulSoup(html_body, "lxml")
-    header_map = {
-        # Chave interna -> Lista de possíveis nomes normalizados no cabeçalho do e-mail
-        "ORGAO": [N("Órgão"), N("Orgao Regulador")],
-        "TIPO": [N("Tipo")],
-        "NUMERO": [N("Número")],
-        # Mantendo os outros para extração completa, caso necessário no futuro
-        "DATA_ATO": [N("Data do Ato"), N("Data do Normativo")],
-        "EMENTA": [N("Ementa")],
-        "LINK": [N("Link")],
+
+    wanted = {
+        "ORGAO": {N("Órgão"), N("Órgão regulador"), N("Orgao"), N("Orgao Regulador"), N("Orgão Regulador")},
+        "TIPO": {N("Tipo"), N("Tipo da Norma"), N("Espécie"), N("Especie")},
+        "NUMERO": {N("Número"), N("Numero"), N("Nº"), N("No"), N("N."), N("N")},
+        "DATA_ATO": {N("Data do Ato"), N("Data do Normativo"), N("Data"), N("Publicação"), N("Data Publicação")},
+        "EMENTA": {N("Ementa"), N("Assunto"), N("Resumo"), N("Descrição"), N("Descricao")},
+        "VIGENCIA": {N("Vigência"), N("Vigencia")}
     }
 
+    def map_headers_to_keys(header_cells: List[str]) -> Dict[int, str]:
+        idx_to_key: Dict[int, str] = {}
+        for i, h in enumerate(header_cells):
+            for key, variants in wanted.items():
+                if h in variants:
+                    idx_to_key[i] = key
+                    break
+        return idx_to_key
+
+    candidates = []
     for table in soup.find_all("table"):
-        header_elements = table.find_all("th")
-        if not header_elements:
+        trs = table.find_all("tr")
+        if not trs:
             continue
 
-        # Mapeia o índice da coluna para o nome normalizado (ORGAO, TIPO, etc.)
-        index_to_key = {}
-        headers_text = [N(th.get_text(strip=True)) for th in header_elements]
-
-        for i, h_text in enumerate(headers_text):
-            for key, possible_names in header_map.items():
-                for name in possible_names:
-                    # Garante que o nome do cabeçalho corresponda exatamente ou como uma palavra completa
-                    # e que a coluna ainda não tenha sido mapeada.
-                    if (name == h_text or re.search(r'\b' + re.escape(name) + r'\b', h_text)) and i not in index_to_key.values():
-                        index_to_key[i] = key
-                        break  # Sai do loop de 'possible_names'
-
-        # Se não encontrou cabeçalhos relevantes, pula a tabela
-        if not index_to_key:
-            continue
-
-        for tr in table.find_all("tr"):
-            tds = tr.find_all("td")
-            if len(tds) < len(index_to_key):
+        ths = table.find_all("th")
+        if ths:
+            hdr = [N(th.get_text(" ", strip=True)) for th in ths]
+            idx_to_key = map_headers_to_keys(hdr)
+            data_trs = [tr for tr in trs if tr.find_all("td")]
+        else:
+            first_tds = trs[0].find_all(["td", "th"])
+            if not first_tds:
                 continue
+            hdr = [N(td.get_text(" ", strip=True)) for td in first_tds]
+            idx_to_key = map_headers_to_keys(hdr)
+            data_trs = trs[1:]
 
-            row_data = {key: tds[idx].get_text(strip=True) for idx, key in index_to_key.items() if idx < len(tds)}
-            if row_data.get("NUMERO"): # Adiciona a linha apenas se tiver um número
-                rows.append(row_data)
+        keys_present = set(idx_to_key.values())
+        if not ({"NUMERO"} <= keys_present and ({"TIPO"} & keys_present or {"ORGAO"} & keys_present)):
+            continue
 
+        table_rows: List[Dict] = []
+        for tr in data_trs:
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+            row = {}
+            for idx, key in idx_to_key.items():
+                if idx < len(tds):
+                    txt = tds[idx].get_text(" ", strip=True)
+                    row[key] = txt
+            if row.get("NUMERO"):
+                table_rows.append(row)
+
+        score = (len(keys_present & {"ORGAO", "TIPO", "NUMERO", "DATA_ATO"}), len(table_rows))
+        if table_rows:
+            candidates.append((score, table_rows))
+
+    if not candidates:
+        return rows
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_rows = candidates[0][1]
+
+    for r in best_rows:
+        rows.append({
+            "ORGAO": r.get("ORGAO", ""),
+            "TIPO": r.get("TIPO", ""),
+            "NUMERO": r.get("NUMERO", ""),
+            "DATA_ATO": r.get("DATA_ATO", "")
+        })
     return rows
 
 def norm_row(row: Dict) -> Dict:
@@ -240,28 +277,60 @@ def norm_row(row: Dict) -> Dict:
     }
 
 def rows_from_message_body(html: str, plain: str) -> List[Dict]:
-    rows = html_tables_to_rows(html or plain or "")
-    return [norm_row(r) for r in rows if r]
+    # tenta HTML; se falhar totalmente, tenta um fallback pobre no texto simples
+    rows = html_tables_to_rows(html or "")
+    if rows:
+        return [norm_row(r) for r in rows]
+    txt = (plain or "").replace("\xa0", " ")
+    pattern = re.compile(
+        r"(INSTRUÇÃO NORMATIVA|INSTRUCAO NORMATIVA|RESOLUÇÃO|RESOLUCAO|CIRCULAR|CARTA CIRCULAR|COMUNICADO|PORTARIA)"
+        r".*?(\d{3,6}).*?"
+        r"(BANCO CENTRAL DO BRASIL|BANCO CENTRAL|BCB|BACEN|CVM|ANBIMA|CMN)",
+        re.I | re.S
+    )
+    out = []
+    for m in pattern.finditer(txt):
+        out.append(norm_row({
+            "TIPO": m.group(1),
+            "NUMERO": m.group(2),
+            "ORGAO": m.group(3),
+            "DATA_ATO": ""
+        }))
+    return out
 
+# =========================
+# MATCHING (número forte + tolerância órgão/tipo)
+# =========================
 def target_matches_email_row(tgt: pd.Series, r: Dict) -> bool:
-    tgt_num = str(tgt["N_NUM"])
-    email_num = str(r["N_NUM"])
-    tgt_orgao = tgt["N_ORGAO"]
-    email_orgao = r["N_ORGAO"]
-    tgt_tipo = tgt["N_TIPO"]
-    email_tipo = r["N_TIPO"]
+    # número é a âncora principal (exato em dígitos)
+    if str(tgt["N_NUM"]) != str(r["N_NUM"]):
+        logging.debug(f"  [MATCH FAIL] Número: {tgt['N_NUM']} != {r['N_NUM']}")
+        return False
 
-    if tgt_num != email_num:
-        logging.debug(f"  [MATCH FAIL] Número: Meta='{tgt_num}' vs Email='{email_num}'")
-        return False
-    if not any(k in email_orgao for k in [tgt_orgao, "BACEN","BCB","BANCO CENTRAL"]):
-        logging.debug(f"  [MATCH FAIL] Órgão: Meta='{tgt_orgao}' vs Email='{email_orgao}'")
-        return False
-    if not (tgt_tipo in email_tipo or email_tipo in tgt_tipo):
-        logging.debug(f"  [MATCH FAIL] Tipo: Meta='{tgt_tipo}' vs Email='{email_tipo}'")
-        return False
-    return True # A verificação da data do ato foi removida.
+    t_org = tgt["N_ORGAO"]; e_org = r["N_ORGAO"]
+    t_tipo = tgt["N_TIPO"];  e_tipo = r["N_TIPO"]
 
+    # órgão: aceita equivalências mais amplas
+    org_ok = any(alias in e_org for alias in [t_org, "BANCO CENTRAL", "BANCO CENTRAL DO BRASIL", "BCB", "BACEN", "CVM", "ANBIMA", "CMN"])
+    if not org_ok:
+        logging.debug(f"  [MATCH FAIL] Órgão: '{t_org}' not in '{e_org}'")
+        return False
+
+    # tipo: contém (e.g., "INSTRUÇÃO NORMATIVA BCB")
+    tipo_ok = (t_tipo in e_tipo) or (e_tipo in t_tipo)
+    if not tipo_ok:
+        # tolera pequenas diferenças: usa a primeira palavra do tipo
+        head = t_tipo.split()[0] if t_tipo else ""
+        tipo_ok = bool(head) and head in e_tipo
+    if not tipo_ok:
+        logging.debug(f"  [MATCH FAIL] Tipo: '{t_tipo}' vs '{e_tipo}'")
+        return False
+
+    return True
+
+# =========================
+# PDF helpers
+# =========================
 def find_pdf_attachments(mail, number_digits: str, tipo_norm: str) -> List[Tuple[str, object]]:
     found = []
     try:
@@ -376,10 +445,8 @@ def iter_candidate_messages(folder, subjects: List[str]) -> List:
             if norm_from.endswith(N(SENDER_EMAIL)) and any(ns in norm_subj for ns in norm_subjects):
                 out.append(mail)
 
-            # Correção do fuso horário: torna o 'now()' ciente do fuso horário local
             rec = getattr(mail, "ReceivedTime", None)
             now_aware = dt.datetime.now(rec.tzinfo if rec else None)
-
             if isinstance(rec, dt.datetime) and (now_aware - rec).days > 15:
                 break
         except Exception as e:
