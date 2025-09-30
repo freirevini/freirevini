@@ -21,7 +21,7 @@ SENDER_EMAIL = "informe@mkcompliance.com.br"
 SUBJECT_PREFIX = "[EXT] - Normativos Divulgados em "  # o assunto termina com dd/mm/yyyy
 
 # >>>>> TESTE: edite a(s) data(s) abaixo (dd/mm/yyyy) e deixe ESTA linha ativa nos testes
-SUBJECT_DATES = ["25/09/2025"]  # coloque a(s) data(s) que quer testar
+SUBJECT_DATES = ["26/09/2025"]  # coloque a(s) data(s) que quer testar
 
 # >>>>> PRODUÇÃO: comente a linha acima e DESCOMENTE esta para pegar HOJE e os 2 dias anteriores
 # SUBJECT_DATES = [(dt.datetime.today() - dt.timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, 3)]
@@ -169,57 +169,58 @@ def load_targets_from_excel(path: str) -> pd.DataFrame:
     logging.debug(f"Exemplo metas:\n{df2.head(3)}")
     return df2
 
-def html_tables_to_rows(html: str) -> List[Dict]:
+def html_tables_to_rows(html_body: str) -> List[Dict]:
+    """
+    Extrai linhas de tabelas de um corpo de e-mail HTML usando BeautifulSoup.
+    Esta abordagem é mais robusta que pd.read_html para HTMLs de e-mail.
+    """
     rows: List[Dict] = []
-    if not html:
+    if not html_body:
         return rows
-    try:
-        dfs = pd.read_html(html)
-    except ValueError:
-        dfs = []
 
-    def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-        hm = {
-            "ORGAO": {"ÓRGÃO","ORGAO","ORGÃO","ÓRGÃO REGULADOR","ORGAO REGULADOR","ORG"},
-            "TIPO": {"TIPO","TIPO DA NORMA","ESPÉCIE","ESPECIE"},
-            "NUMERO": {"NÚMERO","NUMERO","Nº","N.","NO","N"},
-            "DATA_ATO": {"DATA DO ATO","DATA","PUBLICAÇÃO","PUBLICACAO","DATA DA PUBLICAÇÃO"},
-            "EMENTA": {"EMENTA","ASSUNTO","RESUMO","DESCRIÇÃO","DESCRICAO"},
-            "LINK": {"LINK","URL","PDF","ARQUIVO"}
-        }
-        newcols = []
-        for c in df.columns:
-            cn = N(str(c))
-            mapped = None
-            for k, variants in hm.items():
-                if cn in {N(v) for v in variants}:
-                    mapped = k; break
-            newcols.append(mapped or cn)
-        df.columns = newcols
-        return df
+    soup = BeautifulSoup(html_body, "lxml")
+    header_map = {
+        # Chave interna -> Lista de possíveis nomes normalizados no cabeçalho do e-mail
+        "ORGAO": [N("Órgão"), N("Orgao Regulador")],
+        "TIPO": [N("Tipo")],
+        "NUMERO": [N("Número")],
+        # Mantendo os outros para extração completa, caso necessário no futuro
+        "DATA_ATO": [N("Data do Ato"), N("Data do Normativo")],
+        "EMENTA": [N("Ementa")],
+        "LINK": [N("Link")],
+    }
 
-    for df in dfs:
-        df = normalize_headers(df)
-        for _, r in df.iterrows():
-            rows.append({k: (None if pd.isna(v) else str(v)) for k, v in r.to_dict().items()})
+    for table in soup.find_all("table"):
+        header_elements = table.find_all("th")
+        if not header_elements:
+            continue
 
-    if not rows:
-        soup = BeautifulSoup(html, "lxml")
-        for table in soup.select("table"):
-            headers = []
-            ths = table.select("thead th") or table.select("tr th")
-            if ths:
-                headers = [N(th.get_text(" ", strip=True)) for th in ths]
-            for tr in table.select("tr"):
-                tds = tr.find_all("td")
-                if not tds:
-                    continue
-                vals = [td.get_text(" ", strip=True) for td in tds]
-                if headers and len(headers) == len(vals):
-                    row = {headers[i]: vals[i] for i in range(len(vals))}
-                else:
-                    row = {f"C{i+1}": v for i, v in enumerate(vals)}
-                rows.append(row)
+        # Mapeia o índice da coluna para o nome normalizado (ORGAO, TIPO, etc.)
+        index_to_key = {}
+        headers_text = [N(th.get_text(strip=True)) for th in header_elements]
+
+        for i, h_text in enumerate(headers_text):
+            for key, possible_names in header_map.items():
+                for name in possible_names:
+                    # Garante que o nome do cabeçalho corresponda exatamente ou como uma palavra completa
+                    # e que a coluna ainda não tenha sido mapeada.
+                    if (name == h_text or re.search(r'\b' + re.escape(name) + r'\b', h_text)) and i not in index_to_key.values():
+                        index_to_key[i] = key
+                        break  # Sai do loop de 'possible_names'
+
+        # Se não encontrou cabeçalhos relevantes, pula a tabela
+        if not index_to_key:
+            continue
+
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < len(index_to_key):
+                continue
+
+            row_data = {key: tds[idx].get_text(strip=True) for idx, key in index_to_key.items() if idx < len(tds)}
+            if row_data.get("NUMERO"): # Adiciona a linha apenas se tiver um número
+                rows.append(row_data)
+
     return rows
 
 def norm_row(row: Dict) -> Dict:
@@ -259,11 +260,7 @@ def target_matches_email_row(tgt: pd.Series, r: Dict) -> bool:
     if not (tgt_tipo in email_tipo or email_tipo in tgt_tipo):
         logging.debug(f"  [MATCH FAIL] Tipo: Meta='{tgt_tipo}' vs Email='{email_tipo}'")
         return False
-    td, rd = tgt["DATA_ATO_DT"], r["DATA_ATO_DT"]
-    if td and rd and abs((td - rd).days) > 2:
-        logging.debug(f"  [MATCH FAIL] Data do ato: Meta='{td}' vs Email='{rd}'")
-        return False
-    return True
+    return True # A verificação da data do ato foi removida.
 
 def find_pdf_attachments(mail, number_digits: str, tipo_norm: str) -> List[Tuple[str, object]]:
     found = []
@@ -378,8 +375,12 @@ def iter_candidate_messages(folder, subjects: List[str]) -> List:
             norm_from = N(from_addr)
             if norm_from.endswith(N(SENDER_EMAIL)) and any(ns in norm_subj for ns in norm_subjects):
                 out.append(mail)
+
+            # Correção do fuso horário: torna o 'now()' ciente do fuso horário local
             rec = getattr(mail, "ReceivedTime", None)
-            if isinstance(rec, dt.datetime) and (dt.datetime.now() - rec).days > 15:
+            now_aware = dt.datetime.now(rec.tzinfo if rec else None)
+
+            if isinstance(rec, dt.datetime) and (now_aware - rec).days > 15:
                 break
         except Exception as e:
             logging.debug(f"Ignorando item não-mensagem: {e}")
