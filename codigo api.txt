@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import re
-import io
-import csv
 import json
-import time
-import glob
-import hashlib
 import logging
 import pathlib
 import gc
@@ -28,22 +23,28 @@ SUBJECT_PREFIX = "[EXT] - Normativos Divulgados em "  # o assunto termina com dd
 # >>>>> TESTE: edite a(s) data(s) abaixo (dd/mm/yyyy) e deixe ESTA linha ativa nos testes
 SUBJECT_DATES = ["25/09/2025"]  # coloque a(s) data(s) que quer testar
 
-# >>>>> PRODUÇÃO: comente a linha de cima e DESCOMENTE esta para pegar HOJE e os 2 dias anteriores
+# >>>>> PRODUÇÃO: comente a linha acima e DESCOMENTE esta para pegar HOJE e os 2 dias anteriores
 # SUBJECT_DATES = [(dt.datetime.today() - dt.timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, 3)]
 
-# Caminhos
+# PASTA NO OUTLOOK (regra move os e-mails para cá)
+OUTLOOK_FOLDER_PATH = r"Caixa de Entrada\Normas MK Compliance"
+# Exemplos alternativos:
+# OUTLOOK_FOLDER_PATH = r"Inbox\Normas MK Compliance"
+# OUTLOOK_FOLDER_PATH = r"seu.email@empresa.com.br\Inbox\Normas MK Compliance"
+
+# Caminhos de arquivos/pastas locais/rede
 EXCEL_METAS = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\3_BaseMK\BaseMkNormasParaAvaliar.xlsx"
 SAVE_DIR = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook")
 LOG_CSV = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\log_baixas.csv")
 LOG_XLSX = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\log_baixas.xlsx")
 STATE_JSON = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\state.json")
 
-# Filtros opcionais
+# Filtros opcionais (pode deixar set() para não filtrar por aqui)
 ORGAOS_ALLOW = {"BACEN", "BCB", "BANCO CENTRAL DO BRASIL", "CVM", "ANBIMA", "CMN"}
 TIPOS_ALLOW = {"INSTRUCAO NORMATIVA", "RESOLUCAO", "CIRCULAR", "CARTA CIRCULAR", "COMUNICADO", "PORTARIA"}
 
 HTTP_TIMEOUT = 45
-LOG_LEVEL = logging.DEBUG  # DEBUG p/ detalhar
+LOG_LEVEL = logging.DEBUG  # DEBUG para ver o que está acontecendo
 
 # =========================
 # LOG
@@ -72,7 +73,7 @@ def sanitize_filename(s: str) -> str:
     return s[:180]
 
 def parse_date_flexible(s: str) -> Optional[dt.date]:
-    """Robusto para: dd/mm/yyyy, yyyy-mm-dd, '26 de set de 2025', '30 de agosto de 2024' etc."""
+    """Robusto para dd/mm/yyyy, yyyy-mm-dd, '26 de set de 2025', etc."""
     if not s:
         return None
     s = str(s).strip()
@@ -80,7 +81,6 @@ def parse_date_flexible(s: str) -> Optional[dt.date]:
         return dtparser.parse(s, dayfirst=True).date()
     except Exception:
         pass
-
     m = re.search(r"(\d{1,2})\s+de\s+([a-zç\.]+)\s+de\s+(\d{4})", s, flags=re.IGNORECASE)
     if m:
         d = int(m.group(1))
@@ -99,9 +99,6 @@ def parse_date_flexible(s: str) -> Optional[dt.date]:
         if 1 <= mes <= 12:
             return dt.date(y, mes, d)
     return None
-
-def date_to_ddmmyyyy(d: dt.date) -> str:
-    return d.strftime("%d/%m/%Y")
 
 def build_expected_subjects() -> List[str]:
     return [f"{SUBJECT_PREFIX}{d}" for d in SUBJECT_DATES]
@@ -125,18 +122,13 @@ def _read_excel_any(path: str) -> pd.DataFrame:
         logging.debug(f"Lendo Excel com usecols={cols_to_read}")
         return pd.read_excel(path, usecols=cols_to_read)
     except Exception as e:
-        logging.warning(f"usecols não bateu com o arquivo ({e}). Lendo planilha completa…")
+        logging.warning(f"usecols não bateu ({e}). Lendo planilha completa…")
         return pd.read_excel(path)
 
 def load_targets_from_excel(path: str) -> pd.DataFrame:
-    """
-    Lê a planilha de metas e normaliza colunas:
-      Órgão | Tipo | Número | Data do Ato (aceita variações)
-    """
     df = _read_excel_any(path)
     logging.info(f"Planilha carregada: {df.shape[0]} linhas, colunas: {list(df.columns)}")
 
-    # normaliza nomes das colunas
     colmap = {N(c): c for c in df.columns}
     def colfind(cands: List[str]) -> Optional[str]:
         for c in cands:
@@ -161,13 +153,11 @@ def load_targets_from_excel(path: str) -> pd.DataFrame:
         "DATA_ATO": df[col_data].astype(str),
     })
 
-    # normalizados
     df2["N_ORGAO"] = df2["ORGAO"].map(N)
     df2["N_TIPO"]  = df2["TIPO"].map(N)
     df2["N_NUM"]   = df2["NUMERO"].map(only_digits)
     df2["DATA_ATO_DT"] = df2["DATA_ATO"].map(parse_date_flexible)
 
-    # filtros (opcionais)
     before = len(df2)
     if ORGAOS_ALLOW:
         df2 = df2[df2["N_ORGAO"].apply(lambda x: any(k in x for k in ORGAOS_ALLOW))].copy()
@@ -176,16 +166,13 @@ def load_targets_from_excel(path: str) -> pd.DataFrame:
     logging.info(f"Metas após filtros: {len(df2)} (antes: {before})")
 
     df2.reset_index(drop=True, inplace=True)
-    logging.debug(f"Exemplo de metas normalizadas:\n{df2.head(3)}")
+    logging.debug(f"Exemplo metas:\n{df2.head(3)}")
     return df2
 
 def html_tables_to_rows(html: str) -> List[Dict]:
-    """Extrai linhas de todas as tabelas do HTML."""
     rows: List[Dict] = []
     if not html:
         return rows
-
-    # 1) pandas.read_html
     try:
         dfs = pd.read_html(html)
     except ValueError:
@@ -216,7 +203,6 @@ def html_tables_to_rows(html: str) -> List[Dict]:
         for _, r in df.iterrows():
             rows.append({k: (None if pd.isna(v) else str(v)) for k, v in r.to_dict().items()})
 
-    # 2) fallback BS4 <table>
     if not rows:
         soup = BeautifulSoup(html, "lxml")
         for table in soup.select("table"):
@@ -226,7 +212,7 @@ def html_tables_to_rows(html: str) -> List[Dict]:
                 headers = [N(th.get_text(" ", strip=True)) for th in ths]
             for tr in table.select("tr"):
                 tds = tr.find_all("td")
-                if not tds: 
+                if not tds:
                     continue
                 vals = [td.get_text(" ", strip=True) for td in tds]
                 if headers and len(headers) == len(vals):
@@ -234,7 +220,6 @@ def html_tables_to_rows(html: str) -> List[Dict]:
                 else:
                     row = {f"C{i+1}": v for i, v in enumerate(vals)}
                 rows.append(row)
-
     return rows
 
 def norm_row(row: Dict) -> Dict:
@@ -281,7 +266,6 @@ def target_matches_email_row(tgt: pd.Series, r: Dict) -> bool:
     return True
 
 def find_pdf_attachments(mail, number_digits: str, tipo_norm: str) -> List[Tuple[str, object]]:
-    """Seleciona anexos PDF cujo nome bate com o número e (preferencial) com o tipo."""
     found = []
     try:
         cnt = int(getattr(mail.Attachments, "Count", 0))
@@ -318,7 +302,7 @@ def find_pdf_links_in_body(html: str, number_digits: str) -> List[str]:
 def download_link(url: str, dest: pathlib.Path) -> bool:
     try:
         r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
-        if r.status_code >= 400: 
+        if r.status_code >= 400:
             return False
         dest.write_bytes(r.content)
         return True
@@ -343,16 +327,45 @@ def mark_logged(state: Dict, entry_id: str, number_digits: str):
         keys.append(key)
 
 # =========================
-# OUTLOOK
+# OUTLOOK: abrir pasta por caminho
 # =========================
-def open_inbox():
-    logging.info("Abrindo Inbox do Outlook…")
-    outlook = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    inbox = outlook.GetDefaultFolder(6)  # 6 = Inbox
-    return inbox
+def open_outlook_folder_by_path(path_str: str):
+    """Abre uma pasta do Outlook a partir de um caminho com '\'.
+    Suporta: 'Inbox\Subpasta', 'Caixa de Entrada\Subpasta',
+             ou 'Mailbox\Inbox\Subpasta' (quando há múltiplos stores)."""
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    parts = [p for p in path_str.split("\\") if p.strip()]
+    if not parts:
+        return ns.GetDefaultFolder(6)  # Inbox
 
-def iter_candidate_messages(inbox, subjects: List[str]) -> List:
-    items = inbox.Items
+    # Verifica se o primeiro segmento é um mailbox (store)
+    root = None
+    first = parts[0]
+    for i in range(1, ns.Folders.Count + 1):
+        store = ns.Folders.Item(i)
+        if str(store.Name).strip().lower() == first.strip().lower():
+            root = store
+            parts = parts[1:]
+            break
+
+    if root is None:
+        # começa na Inbox padrão
+        root = ns.GetDefaultFolder(6)
+        # se o primeiro segmento for "Inbox" ou "Caixa de Entrada", consome
+        if first.strip().lower() in ["inbox", "caixa de entrada"]:
+            parts = parts[1:]
+
+    folder = root
+    for p in parts:
+        folder = folder.Folders.Item(p)
+    return folder
+
+def open_inbox():
+    logging.info(f"Abrindo pasta do Outlook: {OUTLOOK_FOLDER_PATH}")
+    return open_outlook_folder_by_path(OUTLOOK_FOLDER_PATH)
+
+def iter_candidate_messages(folder, subjects: List[str]) -> List:
+    items = folder.Items
     items.Sort("[ReceivedTime]", True)
     norm_subjects = {N(s) for s in subjects}
     logging.debug(f"Assuntos esperados: {norm_subjects}")
@@ -363,10 +376,8 @@ def iter_candidate_messages(inbox, subjects: List[str]) -> List:
             from_addr = str(getattr(mail, "SenderEmailAddress", "") or "")
             norm_subj = N(subj)
             norm_from = N(from_addr)
-
             if norm_from.endswith(N(SENDER_EMAIL)) and any(ns in norm_subj for ns in norm_subjects):
                 out.append(mail)
-
             rec = getattr(mail, "ReceivedTime", None)
             if isinstance(rec, dt.datetime) and (dt.datetime.now() - rec).days > 15:
                 break
@@ -390,18 +401,17 @@ def main():
     except Exception as e:
         logging.error(f"Falha ao ler planilha: {e}")
         return
-
     if metas.empty:
         logging.info("Planilha de metas vazia após filtros.")
         return
 
-    # 2) Outlook: localizar mensagens candidatas
-    inbox = open_inbox()
+    # 2) localizar mensagens
+    folder = open_inbox()
     subjects = build_expected_subjects()
-    mails = iter_candidate_messages(inbox, subjects)
-    logging.info(f"E-mails candidatos: {len(mails)}")
+    mails = iter_candidate_messages(folder, subjects)
+    logging.info(f"E-mails candidatos na pasta '{OUTLOOK_FOLDER_PATH}': {len(mails)}")
     if not mails:
-        logging.warning("Nenhum e-mail candidato encontrado (verifique data de teste/assunto).")
+        logging.warning("Nenhum e-mail candidato encontrado (verifique data de teste/assunto/pasta).")
 
     state = load_state()
     log_rows: List[Dict] = []
@@ -423,7 +433,7 @@ def main():
                 continue
             logging.debug(f"Linhas na tabela do e-mail: {len(email_rows)}")
 
-            for i, tgt in metas.iterrows():
+            for _, tgt in metas.iterrows():
                 try:
                     number_digits = str(tgt["N_NUM"])
                     if already_logged(state, entry_id, number_digits):
@@ -439,8 +449,8 @@ def main():
 
                     logging.info(f"  [MATCH] {tgt['ORGAO']} | {tgt['TIPO']} | {tgt['NUMERO']}")
 
-                    # anexos
                     saved_paths = []
+                    # anexos
                     attachments = find_pdf_attachments(mail, number_digits, str(tgt["TIPO"]))
                     if attachments:
                         logging.debug(f"    Anexos candidatos: {len(attachments)}")
@@ -461,7 +471,7 @@ def main():
                             logging.info(f"    -> Anexo salvo: {dest}")
                             saved_paths.append(str(dest))
 
-                    # links
+                    # links no corpo
                     if not saved_paths:
                         links = find_pdf_links_in_body(html, number_digits)
                         logging.debug(f"    Links PDF: {len(links)}")
@@ -514,11 +524,9 @@ def main():
         ensure_dir(LOG_CSV.parent)
         df_log = pd.DataFrame(log_rows)
 
-        # CSV (append)
         header = not LOG_CSV.exists()
         df_log.to_csv(LOG_CSV, mode='a', header=header, index=False, encoding="utf-8-sig")
 
-        # Excel (merge)
         try:
             if LOG_XLSX.exists():
                 df_existente = pd.read_excel(LOG_XLSX)
