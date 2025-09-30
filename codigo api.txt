@@ -32,25 +32,23 @@ SUBJECT_DATES = ["25/09/2025"]  # coloque a(s) data(s) que quer testar
 # SUBJECT_DATES = [(dt.datetime.today() - dt.timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, 3)]
 
 # Caminhos
-EXCEL_METAS = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\3_BaseMK\BaseMkNormasParaAvaliar.xlsx"           # planilha com as metas (Órgão, Tipo, Número, Data do Ato)
-SAVE_DIR = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook")   # pasta de rede de destino dos PDFs
+EXCEL_METAS = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\3_BaseMK\BaseMkNormasParaAvaliar.xlsx"
+SAVE_DIR = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook")
 LOG_CSV = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\log_baixas.csv")
 LOG_XLSX = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\log_baixas.xlsx")
 STATE_JSON = pathlib.Path(r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\7_LogExecucao\state.json")
 
-# Opcional: filtros adicionais por órgão/tipo (todos normalizados/sem acento/upper).
-# Deixe vazios para aceitar qualquer órgão/tipo da planilha.
+# Filtros opcionais
 ORGAOS_ALLOW = {"BACEN", "BCB", "BANCO CENTRAL DO BRASIL", "CVM", "ANBIMA", "CMN"}
 TIPOS_ALLOW = {"INSTRUCAO NORMATIVA", "RESOLUCAO", "CIRCULAR", "CARTA CIRCULAR", "COMUNICADO", "PORTARIA"}
 
-HTTP_TIMEOUT = 45  # s para download de PDF por link
-LOG_LEVEL = logging.DEBUG # Alterado para DEBUG para exibir mais detalhes
+HTTP_TIMEOUT = 45
+LOG_LEVEL = logging.DEBUG  # DEBUG p/ detalhar
 
 # =========================
 # LOG
 # =========================
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
-
 
 # =========================
 # HELPERS
@@ -74,16 +72,15 @@ def sanitize_filename(s: str) -> str:
     return s[:180]
 
 def parse_date_flexible(s: str) -> Optional[dt.date]:
+    """Robusto para: dd/mm/yyyy, yyyy-mm-dd, '26 de set de 2025', '30 de agosto de 2024' etc."""
     if not s:
         return None
     s = str(s).strip()
-    # dd/mm/yyyy ou yyyy-mm-dd resolvem direto:
     try:
-        # tenta dayfirst
         return dtparser.parse(s, dayfirst=True).date()
     except Exception:
         pass
-    # "26 de set de 2025" / "30 de agosto de 2024"
+
     m = re.search(r"(\d{1,2})\s+de\s+([a-zç\.]+)\s+de\s+(\d{4})", s, flags=re.IGNORECASE)
     if m:
         d = int(m.group(1))
@@ -94,6 +91,10 @@ def parse_date_flexible(s: str) -> Optional[dt.date]:
             "out":10,"outubro":10,"nov":11,"novembro":11,"dez":12,"dezembro":12
         }
         mes = mapa.get(mes_raw)
+        try:
+            mes = int(mes)
+        except Exception:
+            mes = 0
         y = int(m.group(3))
         if 1 <= mes <= 12:
             return dt.date(y, mes, d)
@@ -117,35 +118,36 @@ def save_state(state: Dict) -> None:
     ensure_dir(STATE_JSON.parent)
     STATE_JSON.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def _read_excel_any(path: str) -> pd.DataFrame:
+    """Tenta ler com usecols; se falhar, faz fallback p/ ler tudo."""
+    try:
+        cols_to_read = ["Órgão regulador", "Tipo", "Número", "Data do Normativo"]
+        logging.debug(f"Lendo Excel com usecols={cols_to_read}")
+        return pd.read_excel(path, usecols=cols_to_read)
+    except Exception as e:
+        logging.warning(f"usecols não bateu com o arquivo ({e}). Lendo planilha completa…")
+        return pd.read_excel(path)
+
 def load_targets_from_excel(path: str) -> pd.DataFrame:
     """
     Lê a planilha de metas e normaliza colunas:
-      Órgão | Tipo | Número | Data do Ato
-    Aceita variantes de cabeçalho.
+      Órgão | Tipo | Número | Data do Ato (aceita variações)
     """
-    # Define as colunas que precisamos ler da planilha.
-    # Isso otimiza a leitura, evitando carregar dados desnecessários.
-    cols_to_read = [
-        "Órgão regulador",
-        "Tipo",
-        "Número",
-        "Data do Normativo"
-    ]
-    df = pd.read_excel(path, usecols=cols_to_read)
+    df = _read_excel_any(path)
+    logging.info(f"Planilha carregada: {df.shape[0]} linhas, colunas: {list(df.columns)}")
 
     # normaliza nomes das colunas
     colmap = {N(c): c for c in df.columns}
     def colfind(cands: List[str]) -> Optional[str]:
-        """Encontra o nome real da coluna a partir de uma lista de candidatos."""
         for c in cands:
             if N(c) in colmap:
                 return colmap[N(c)]
         return None
 
-    col_org = colfind(["Órgão regulador", "Órgão", "Orgao", "Orgão", "Orgão Regulador", "Orgao Regulador"])
-    col_tipo = colfind(["Tipo", "Tipo da Norma", "Espécie", "Especie"])
-    col_num  = colfind(["Número", "Numero", "Nº", "No", "N."])
-    col_data = colfind(["Data do Normativo", "Data do Ato", "Data", "Publicação", "Data Publicação"])
+    col_org = colfind(["Órgão regulador","Órgão","Orgao","Orgão","Orgão Regulador","Orgao Regulador"])
+    col_tipo = colfind(["Tipo","Tipo da Norma","Espécie","Especie"])
+    col_num  = colfind(["Número","Numero","Nº","No","N.","N"])
+    col_data = colfind(["Data do Normativo","Data do Ato","Data","Publicação","Data Publicação"])
 
     missing = [("Órgão", col_org), ("Tipo", col_tipo), ("Número", col_num), ("Data do Ato", col_data)]
     miss = [n for n, v in missing if v is None]
@@ -162,16 +164,19 @@ def load_targets_from_excel(path: str) -> pd.DataFrame:
     # normalizados
     df2["N_ORGAO"] = df2["ORGAO"].map(N)
     df2["N_TIPO"]  = df2["TIPO"].map(N)
-    df2["N_NUM"]   = df2["NUMERO"].map(lambda x: only_digits(x))
+    df2["N_NUM"]   = df2["NUMERO"].map(only_digits)
     df2["DATA_ATO_DT"] = df2["DATA_ATO"].map(parse_date_flexible)
 
     # filtros (opcionais)
+    before = len(df2)
     if ORGAOS_ALLOW:
         df2 = df2[df2["N_ORGAO"].apply(lambda x: any(k in x for k in ORGAOS_ALLOW))].copy()
     if TIPOS_ALLOW:
         df2 = df2[df2["N_TIPO"].apply(lambda x: any(k in x for k in TIPOS_ALLOW))].copy()
+    logging.info(f"Metas após filtros: {len(df2)} (antes: {before})")
 
     df2.reset_index(drop=True, inplace=True)
+    logging.debug(f"Exemplo de metas normalizadas:\n{df2.head(3)}")
     return df2
 
 def html_tables_to_rows(html: str) -> List[Dict]:
@@ -215,16 +220,14 @@ def html_tables_to_rows(html: str) -> List[Dict]:
     if not rows:
         soup = BeautifulSoup(html, "lxml")
         for table in soup.select("table"):
-            # cabeçalho
             headers = []
-            ths = table.select("thead th")
-            if not ths:
-                ths = table.select("tr th")
+            ths = table.select("thead th") or table.select("tr th")
             if ths:
                 headers = [N(th.get_text(" ", strip=True)) for th in ths]
             for tr in table.select("tr"):
                 tds = tr.find_all("td")
-                if not tds: continue
+                if not tds: 
+                    continue
                 vals = [td.get_text(" ", strip=True) for td in tds]
                 if headers and len(headers) == len(vals):
                     row = {headers[i]: vals[i] for i in range(len(vals))}
@@ -235,7 +238,6 @@ def html_tables_to_rows(html: str) -> List[Dict]:
     return rows
 
 def norm_row(row: Dict) -> Dict:
-    """Normaliza uma linha vinda do HTML do e-mail."""
     def g(*keys):
         for k in keys:
             if k in row and row[k] is not None:
@@ -256,7 +258,6 @@ def rows_from_message_body(html: str, plain: str) -> List[Dict]:
     return [norm_row(r) for r in rows if r]
 
 def target_matches_email_row(tgt: pd.Series, r: Dict) -> bool:
-    """Compara meta (planilha) com linha do e-mail (normalizada)."""
     tgt_num = str(tgt["N_NUM"])
     email_num = str(r["N_NUM"])
     tgt_orgao = tgt["N_ORGAO"]
@@ -264,43 +265,43 @@ def target_matches_email_row(tgt: pd.Series, r: Dict) -> bool:
     tgt_tipo = tgt["N_TIPO"]
     email_tipo = r["N_TIPO"]
 
-    # Número: exato em dígitos
     if tgt_num != email_num:
-        logging.debug(f"  [MATCH FAIL] Número diferente: Meta='{tgt_num}' vs Email='{email_num}'")
+        logging.debug(f"  [MATCH FAIL] Número: Meta='{tgt_num}' vs Email='{email_num}'")
         return False
-    # Órgão: contém (permite “BANCO CENTRAL DO BRASIL” vs “BACEN”)
     if not any(k in email_orgao for k in [tgt_orgao, "BACEN","BCB","BANCO CENTRAL"]):
-        logging.debug(f"  [MATCH FAIL] Órgão não corresponde: Meta='{tgt_orgao}' vs Email='{email_orgao}'")
+        logging.debug(f"  [MATCH FAIL] Órgão: Meta='{tgt_orgao}' vs Email='{email_orgao}'")
         return False
-    # Tipo: contém (INSTRUÇÃO NORMATIVA pode aparecer “INSTRUÇÃO NORMATIVA BCB”)
     if not (tgt_tipo in email_tipo or email_tipo in tgt_tipo):
-        logging.debug(f"  [MATCH FAIL] Tipo não corresponde: Meta='{tgt_tipo}' vs Email='{email_tipo}'")
+        logging.debug(f"  [MATCH FAIL] Tipo: Meta='{tgt_tipo}' vs Email='{email_tipo}'")
         return False
-    # Data do ato: igualdade tolerante (até +/- 2 dias se parse ok)
     td, rd = tgt["DATA_ATO_DT"], r["DATA_ATO_DT"]
     if td and rd and abs((td - rd).days) > 2:
-        logging.debug(f"  [MATCH FAIL] Data do ato fora da tolerância: Meta='{td}' vs Email='{rd}'")
+        logging.debug(f"  [MATCH FAIL] Data do ato: Meta='{td}' vs Email='{rd}'")
         return False
     return True
 
-def find_pdf_attachments(mail, number_digits: str, tipo_norm: str) -> List[Tuple[str, bytes]]:
+def find_pdf_attachments(mail, number_digits: str, tipo_norm: str) -> List[Tuple[str, object]]:
     """Seleciona anexos PDF cujo nome bate com o número e (preferencial) com o tipo."""
     found = []
-    for att in list(mail.Attachments):
-        name = str(att.FileName or "")
-        if not name.lower().endswith(".pdf"):
-            continue
-        n_ok = number_digits in N(name)
-        t_ok = N(tipo_norm).split()[0] in N(name)  # primeira palavra do tipo
-        if n_ok and t_ok:
-            found.append((name, att))
-    # fallback: só por número
-    if not found:
-        for att in list(mail.Attachments):
-            name = str(att.FileName or "")
-            if name.lower().endswith(".pdf") and number_digits in N(name):
+    try:
+        cnt = int(getattr(mail.Attachments, "Count", 0))
+        for i in range(1, cnt + 1):
+            att = mail.Attachments.Item(i)
+            name = str(getattr(att, "FileName", "") or "")
+            if not name.lower().endswith(".pdf"):
+                continue
+            n_ok = number_digits in N(name)
+            t_ok = N(tipo_norm).split()[0] in N(name) if tipo_norm else False
+            if n_ok and t_ok:
                 found.append((name, att))
-    # baixa bytes só quando for salvar (aqui retorna o objeto)
+        if not found:
+            for i in range(1, cnt + 1):
+                att = mail.Attachments.Item(i)
+                name = str(getattr(att, "FileName", "") or "")
+                if name.lower().endswith(".pdf") and number_digits in N(name):
+                    found.append((name, att))
+    except Exception as e:
+        logging.error(f"Erro ao ler anexos: {e}")
     return found
 
 def find_pdf_links_in_body(html: str, number_digits: str) -> List[str]:
@@ -317,7 +318,8 @@ def find_pdf_links_in_body(html: str, number_digits: str) -> List[str]:
 def download_link(url: str, dest: pathlib.Path) -> bool:
     try:
         r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
-        if r.status_code >= 400: return False
+        if r.status_code >= 400: 
+            return False
         dest.write_bytes(r.content)
         return True
     except Exception as e:
@@ -344,16 +346,16 @@ def mark_logged(state: Dict, entry_id: str, number_digits: str):
 # OUTLOOK
 # =========================
 def open_inbox():
+    logging.info("Abrindo Inbox do Outlook…")
     outlook = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
     inbox = outlook.GetDefaultFolder(6)  # 6 = Inbox
     return inbox
 
 def iter_candidate_messages(inbox, subjects: List[str]) -> List:
-    """Percorre do mais novo ao mais antigo e retorna só os que batem remetente + assunto esperado."""
     items = inbox.Items
     items.Sort("[ReceivedTime]", True)
-    # Normaliza os assuntos esperados para uma busca mais flexível
     norm_subjects = {N(s) for s in subjects}
+    logging.debug(f"Assuntos esperados: {norm_subjects}")
     out = []
     for mail in items:
         try:
@@ -362,15 +364,14 @@ def iter_candidate_messages(inbox, subjects: List[str]) -> List:
             norm_subj = N(subj)
             norm_from = N(from_addr)
 
-            # Verifica se o remetente é o correto e se o assunto contém um dos assuntos esperados
-            if norm_from.endswith(N(SENDER_EMAIL)) and any(expected_subj in norm_subj for expected_subj in norm_subjects):
-                    out.append(mail)
+            if norm_from.endswith(N(SENDER_EMAIL)) and any(ns in norm_subj for ns in norm_subjects):
+                out.append(mail)
 
-            # early stop (se passou de 15 dias atrás, pare)
             rec = getattr(mail, "ReceivedTime", None)
             if isinstance(rec, dt.datetime) and (dt.datetime.now() - rec).days > 15:
                 break
-        except Exception:
+        except Exception as e:
+            logging.debug(f"Ignorando item não-mensagem: {e}")
             continue
     return out
 
@@ -384,7 +385,12 @@ def main():
 
     # 1) metas
     logging.info(f"1. Carregando metas da planilha: {EXCEL_METAS}")
-    metas = load_targets_from_excel(EXCEL_METAS)
+    try:
+        metas = load_targets_from_excel(EXCEL_METAS)
+    except Exception as e:
+        logging.error(f"Falha ao ler planilha: {e}")
+        return
+
     if metas.empty:
         logging.info("Planilha de metas vazia após filtros.")
         return
@@ -394,148 +400,143 @@ def main():
     subjects = build_expected_subjects()
     mails = iter_candidate_messages(inbox, subjects)
     logging.info(f"E-mails candidatos: {len(mails)}")
+    if not mails:
+        logging.warning("Nenhum e-mail candidato encontrado (verifique data de teste/assunto).")
 
     state = load_state()
     log_rows: List[Dict] = []
 
-    # 3) para cada e-mail, extrair tabela e cruzar
+    # 3) processar e-mails
     for mail in mails:
-        entry_id = str(getattr(mail, "EntryID", ""))
-        mail_identifier = f"ID:{entry_id[:15]}..."
-        subj = str(getattr(mail, "Subject", ""))
-        recd = getattr(mail, "ReceivedTime", None)
-        recd_iso = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
-        html = str(getattr(mail, "HTMLBody", "") or "")
-        plain = str(getattr(mail, "Body", "") or "")
+        try:
+            entry_id = str(getattr(mail, "EntryID", ""))
+            subj = str(getattr(mail, "Subject", ""))
+            recd = getattr(mail, "ReceivedTime", None)
+            recd_iso = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
+            html = str(getattr(mail, "HTMLBody", "") or "")
+            plain = str(getattr(mail, "Body", "") or "")
 
-        email_rows = rows_from_message_body(html, plain)
-        logging.info(f"\n--- Processando e-mail: '{subj}' (Recebido: {recd_iso}) ---")
-        if not email_rows:
-            logging.warning(f"Nenhuma tabela de normativos encontrada no corpo do e-mail.")
-            continue
-        logging.debug(f"Encontradas {len(email_rows)} linhas na tabela do e-mail.")
-
-        # 4) tentar cada meta contra as linhas do e-mail
-        for i, tgt in metas.iterrows():
-            number_digits = str(tgt["N_NUM"])
-            meta_identifier = f"Meta(Órgão='{tgt['ORGAO']}', Tipo='{tgt['TIPO']}', Num='{tgt['NUMERO']}')"
-            logging.debug(f"Verificando {meta_identifier}")
-            # pular se já baixado este número para este e-mail
-            if already_logged(state, entry_id, number_digits):
+            email_rows = rows_from_message_body(html, plain)
+            logging.info(f"\n--- Processando e-mail: '{subj}' (Recebido: {recd_iso}) ---")
+            if not email_rows:
+                logging.warning("Nenhuma tabela de normativos encontrada no corpo do e-mail.")
                 continue
+            logging.debug(f"Linhas na tabela do e-mail: {len(email_rows)}")
 
-            # match em uma das linhas do e-mail
-            matched_row = None
-            for r in email_rows:
-                if target_matches_email_row(tgt, r):
-                    matched_row = r
-                    break
-            if not matched_row:
-                logging.debug(f"  -> Meta não encontrada neste e-mail.")
-                continue  # esta meta não aparece neste e-mail
+            for i, tgt in metas.iterrows():
+                try:
+                    number_digits = str(tgt["N_NUM"])
+                    if already_logged(state, entry_id, number_digits):
+                        continue
 
-            logging.info(f"  [MATCH SUCESSO] {meta_identifier} corresponde a uma linha no e-mail.")
-            # 5) procurar PDF — anexos primeiro
-            logging.debug("  Procurando por anexos PDF correspondentes...")
-            attachments = find_pdf_attachments(mail, number_digits, str(tgt["TIPO"]))
-            saved_paths = []
-            if attachments:
-                logging.debug(f"    -> Encontrados {len(attachments)} anexos PDF.")
-                for name, att in attachments:
-                    outname = build_output_name(
-                        orgao=str(tgt["ORGAO"]),
-                        tipo=str(tgt["TIPO"]),
-                        numero=str(tgt["NUMERO"]),
-                        data_ato=tgt["DATA_ATO_DT"],
-                        fallback=recd.date().isoformat() if isinstance(recd, dt.datetime) else None
-                    )
-                    dest = SAVE_DIR / outname
-                    k = 1
-                    while dest.exists():
-                        dest = SAVE_DIR / sanitize_filename(outname.replace(".pdf", f"_{k}.pdf"))
-                        k += 1
-                    att.SaveAsFile(str(dest))
-                    logging.info(f"    -> Anexo salvo em: {dest}")
-                    saved_paths.append(str(dest))
+                    matched_row = None
+                    for r in email_rows:
+                        if target_matches_email_row(tgt, r):
+                            matched_row = r
+                            break
+                    if not matched_row:
+                        continue
 
-            # 6) se não teve anexo, procurar link .pdf no corpo
-            if not saved_paths:
-                logging.debug("  Nenhum anexo encontrado. Procurando por links PDF no corpo do e-mail...")
-                links = find_pdf_links_in_body(html, number_digits)
-                logging.debug(f"    -> Encontrados {len(links)} links PDF.")
-                for url in links:
-                    outname = build_output_name(
-                        orgao=str(tgt["ORGAO"]),
-                        tipo=str(tgt["TIPO"]),
-                        numero=str(tgt["NUMERO"]),
-                        data_ato=tgt["DATA_ATO_DT"],
-                        fallback=recd.date().isoformat() if isinstance(recd, dt.datetime) else None
-                    )
-                    dest = SAVE_DIR / outname
-                    k = 1
-                    while dest.exists():
-                        dest = SAVE_DIR / sanitize_filename(outname.replace(".pdf", f"_{k}.pdf"))
-                        k += 1
-                    if download_link(url, dest):
-                        logging.info(f"    -> Link baixado e salvo em: {dest}")
-                        saved_paths.append(str(dest))
+                    logging.info(f"  [MATCH] {tgt['ORGAO']} | {tgt['TIPO']} | {tgt['NUMERO']}")
 
-            status = "BAIXADO" if saved_paths else "NAO_ENCONTRADO_PDF"
+                    # anexos
+                    saved_paths = []
+                    attachments = find_pdf_attachments(mail, number_digits, str(tgt["TIPO"]))
+                    if attachments:
+                        logging.debug(f"    Anexos candidatos: {len(attachments)}")
+                        for name, att in attachments:
+                            outname = build_output_name(
+                                orgao=str(tgt["ORGAO"]),
+                                tipo=str(tgt["TIPO"]),
+                                numero=str(tgt["NUMERO"]),
+                                data_ato=tgt["DATA_ATO_DT"],
+                                fallback=recd.date().isoformat() if isinstance(recd, dt.datetime) else None
+                            )
+                            dest = SAVE_DIR / outname
+                            k = 1
+                            while dest.exists():
+                                dest = SAVE_DIR / sanitize_filename(outname.replace(".pdf", f"_{k}.pdf"))
+                                k += 1
+                            att.SaveAsFile(str(dest))
+                            logging.info(f"    -> Anexo salvo: {dest}")
+                            saved_paths.append(str(dest))
 
-            if saved_paths:
-                mark_logged(state, entry_id, number_digits)
+                    # links
+                    if not saved_paths:
+                        links = find_pdf_links_in_body(html, number_digits)
+                        logging.debug(f"    Links PDF: {len(links)}")
+                        for url in links:
+                            outname = build_output_name(
+                                orgao=str(tgt["ORGAO"]),
+                                tipo=str(tgt["TIPO"]),
+                                numero=str(tgt["NUMERO"]),
+                                data_ato=tgt["DATA_ATO_DT"],
+                                fallback=recd.date().isoformat() if isinstance(recd, dt.datetime) else None
+                            )
+                            dest = SAVE_DIR / outname
+                            k = 1
+                            while dest.exists():
+                                dest = SAVE_DIR / sanitize_filename(outname.replace(".pdf", f"_{k}.pdf"))
+                                k += 1
+                            if download_link(url, dest):
+                                logging.info(f"    -> Link salvo: {dest}")
+                                saved_paths.append(str(dest))
 
-            # 7) log
-            logging.debug("  Adicionando resultado ao log.")
-            log_rows.append({
-                "email_entry_id": entry_id,
-                "email_subject": subj,
-                "email_received": recd_iso,
-                "meta_orgao": str(tgt["ORGAO"]),
-                "meta_tipo": str(tgt["TIPO"]),
-                "meta_numero": str(tgt["NUMERO"]),
-                "meta_data_ato": str(tgt["DATA_ATO"]),
-                "match_row_orgao": matched_row.get("ORGAO") if matched_row else None,
-                "match_row_tipo": matched_row.get("TIPO") if matched_row else None,
-                "match_row_numero": matched_row.get("NUMERO") if matched_row else None,
-                "match_row_data_ato": matched_row.get("DATA_ATO") if matched_row else None,
-                "arquivos_salvos": ";".join(saved_paths) if saved_paths else "",
-                "status": status,
-            })
+                    status = "BAIXADO" if saved_paths else "NAO_ENCONTRADO_PDF"
+                    if saved_paths:
+                        mark_logged(state, entry_id, number_digits)
 
-    # 8) persistir logs e estado
+                    log_rows.append({
+                        "email_entry_id": entry_id,
+                        "email_subject": subj,
+                        "email_received": recd_iso,
+                        "meta_orgao": str(tgt["ORGAO"]),
+                        "meta_tipo": str(tgt["TIPO"]),
+                        "meta_numero": str(tgt["NUMERO"]),
+                        "meta_data_ato": str(tgt["DATA_ATO"]),
+                        "match_row_orgao": matched_row.get("ORGAO") if matched_row else None,
+                        "match_row_tipo": matched_row.get("TIPO") if matched_row else None,
+                        "match_row_numero": matched_row.get("NUMERO") if matched_row else None,
+                        "match_row_data_ato": matched_row.get("DATA_ATO") if matched_row else None,
+                        "arquivos_salvos": ";".join(saved_paths) if saved_paths else "",
+                        "status": status,
+                    })
+                except Exception as e_row:
+                    logging.error(f"Erro processando meta '{tgt}': {e_row}")
+                    continue
+        except Exception as e_mail:
+            logging.error(f"Erro processando e-mail: {e_mail}")
+            continue
+
+    # 4) persistir logs/estado
     logging.info("\n--- Finalizando e salvando resultados ---")
     if log_rows:
         ensure_dir(LOG_CSV.parent)
         df_log = pd.DataFrame(log_rows)
 
-        # 1. Salva em CSV (modo append)
+        # CSV (append)
         header = not LOG_CSV.exists()
         df_log.to_csv(LOG_CSV, mode='a', header=header, index=False, encoding="utf-8-sig")
 
-        # 2. Salva em Excel (lendo o existente e concatenando)
+        # Excel (merge)
         try:
             if LOG_XLSX.exists():
-                # Se o Excel já existe, lê, adiciona as novas linhas e salva
                 df_existente = pd.read_excel(LOG_XLSX)
                 df_final_excel = pd.concat([df_existente, df_log], ignore_index=True)
             else:
-                # Se não existe, o DataFrame final é apenas o log atual
                 df_final_excel = df_log
-
-            # Remove duplicatas baseadas em um conjunto de colunas chave para garantir a integridade
-            colunas_chave = ["email_entry_id", "meta_orgao", "meta_tipo", "meta_numero"]
-            df_final_excel.drop_duplicates(subset=colunas_chave, keep='last', inplace=True)
-
+            df_final_excel.drop_duplicates(
+                subset=["email_entry_id","meta_orgao","meta_tipo","meta_numero"],
+                keep='last', inplace=True
+            )
             df_final_excel.to_excel(LOG_XLSX, index=False)
         except Exception as e:
             logging.error(f"Falha ao escrever o log em Excel ({LOG_XLSX}): {e}")
 
         logging.info(f"-> Log salvo em {LOG_CSV} e {LOG_XLSX} ({len(log_rows)} novas entradas).")
     else:
-        logging.info("-> Nenhuma nova meta foi encontrada e baixada nos e-mails candidatos.")
+        logging.info("-> Nenhuma nova meta foi encontrada/baixada.")
 
-    # Libera objetos COM e força a coleta de lixo
     gc.collect()
     save_state(state)
     logging.info("="*20 + " EXECUÇÃO CONCLUÍDA " + "="*20)
