@@ -97,12 +97,10 @@ def file_already_present(dest_dir: str, base_filename: str) -> Optional[str]:
 
 def keyify(orgao_norm: str, tipo_norm: str, nnum: str) -> str:
     """
-    Constrói a chave composta em MAIÚSCULAS com underscores:
-    ex.: BANCO_CENTRAL_DO_BRASIL_COMUNICADO_4923
-    Recebe já os normalizados (N(...)) e número digit-only.
+    CHAVE composta: ORGAO_TIPO_NUMERO (tudo normalizado), ex.: BANCO_CENTRAL_DO_BRASIL_COMUNICADO_4923
     """
     def to_key_part(s: str) -> str:
-        s = re.sub(r"[^\w]+", "_", s)   # não-letras/números -> _
+        s = re.sub(r"[^\w]+", "_", s)
         s = re.sub(r"_+", "_", s).strip("_")
         return s
     return "_".join(filter(None, [to_key_part(orgao_norm), to_key_part(tipo_norm), to_key_part(nnum)]))
@@ -489,12 +487,13 @@ def main():
 
         # Dados da META (parâmetro)
         orgao_meta = str(r["Órgão regulador"])
-        tipo_meta  = str(r["Tipo_META"])      # após merge, 'Tipo' das metas vira 'Tipo_META'
-        numero_vis = str(r["Número_META"])    # idem para 'Número'
+        tipo_meta  = str(r["Tipo_META"])       # após merge, 'Tipo' das metas vira 'Tipo_META'
+        numero_vis = str(r["Número_META"])     # idem para 'Número'
 
-        nnum   = str(r["N_NUM"])              # já vem das metas (coluna preservada)
+        # nnum deve vir do lado META após o merge (tem sufixo)
+        nnum = str(r.get("N_NUM_META", ""))    # <-- correção principal: usar N_NUM_META
+
         key    = str(r["KEY_META"])
-
         base_name = build_output_name_orgao_tipo_num(orgao_meta, tipo_meta, numero_vis)
 
         # Se já existe no filesystem, registra e segue (não duplica)
@@ -551,7 +550,7 @@ def main():
     except Exception as e:
         logging.warning(f"Falha ao salvar saída: {e}")
 
-    logging.info("Processo concluído (v2.2).")
+    logging.info("Processo concluído (v2.3).")
 
 # =========================
 # RUN
