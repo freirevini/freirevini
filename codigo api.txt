@@ -125,8 +125,9 @@ def open_outlook_folder_by_path(path_str: str):
 
     if root is None:
         root = ns.GetDefaultFolder(6)
-        if first.strip().lower() in ["inbox", "caixa de entrada"]:
-            parts = parts[1:]
+    # se o primeiro for Inbox/Caixa de Entrada, ajusta
+    if parts and parts[0].strip().lower() in ["inbox", "caixa de entrada"]:
+        parts = parts[1:]
 
     folder = root
     for p in parts:
@@ -341,6 +342,39 @@ def load_metas_df(path: str) -> pd.DataFrame:
     return metas
 
 # =========================
+# AJUDA PARA FALLBACK (match relaxado por número + órgão/tipo)
+# =========================
+def email_matches_meta_relaxed(email_row: pd.Series, meta_row: pd.Series) -> tuple[int, bool]:
+    """
+    Compara por NÚMERO e valida ÓRGÃO/TIPO de forma flexível.
+    Retorna (score, ok) onde score = 2 (match perfeito de tipo),
+    1 (match parcial por prefixo/contém) ou 0 (sem match).
+    """
+    # mesmo número?
+    if str(email_row.get("N_NUM", "")) != str(meta_row.get("N_NUM", "")):
+        return 0, False
+
+    # órgão com equivalências comuns
+    e_org = str(email_row.get("N_ORGAO", ""))
+    t_org = str(meta_row.get("N_ORGAO_META", ""))
+    org_ok = any(alias in e_org for alias in [t_org, "BANCO CENTRAL", "BANCO CENTRAL DO BRASIL", "BCB", "BACEN", "CVM", "ANBIMA", "CMN"])
+    if not org_ok:
+        return 0, False
+
+    # tipo mais flexível
+    e_tipo = str(email_row.get("N_TIPO", ""))
+    t_tipo = str(meta_row.get("N_TIPO_META", ""))
+    if not e_tipo or not t_tipo:
+        return 0, False
+
+    if t_tipo == e_tipo:
+        return 2, True
+    if t_tipo.split()[0] in e_tipo or e_tipo in t_tipo:
+        return 1, True
+
+    return 0, False
+
+# =========================
 # PDF DOWNLOAD
 # =========================
 def find_pdf_attachments(mail, number_digits: str, tipo_norm: str | None = None) -> List[Tuple[str, object]]:
@@ -473,6 +507,55 @@ def main():
     )
     matched_unique = base_join.drop_duplicates(subset=["KEY_META"], keep="first").copy()
 
+    # -------------------- FALLBACK: NÚMERO + validação flexível de Órgão/Tipo --------------------
+    matched_keys = set(matched_unique["KEY_META"].astype(str))
+
+    extras = []
+    for _, m in metas_df.iterrows():
+        key_meta = str(m["KEY_META"])
+        if key_meta in matched_keys:
+            continue  # já casou pelo join exato de KEY
+
+        # Candidatos do e-mail com MESMO NÚMERO
+        nnum_meta = str(m["N_NUM"])
+        cand = emails_df[emails_df["N_NUM"].astype(str) == nnum_meta].copy()
+        if cand.empty:
+            continue
+
+        # Calcula score de aderência (usa a mesma lógica flexível)
+        def _score_row(e):
+            score, ok = email_matches_meta_relaxed(
+                pd.Series({"N_NUM": e["N_NUM"], "N_ORGAO": e["N_ORGAO"], "N_TIPO": e["N_TIPO"]}),
+                pd.Series({"N_NUM": m["N_NUM"], "N_ORGAO_META": m["N_ORGAO_META"], "N_TIPO_META": m["N_TIPO_META"]})
+            )
+            return score if ok else 0
+
+        cand["__score__"] = cand.apply(_score_row, axis=1)
+        cand = cand[cand["__score__"] > 0]
+        if cand.empty:
+            continue
+
+        # Prioriza melhor tipo e e-mail mais recente
+        cand.sort_values(by=["__score__", "EMAIL_RECEIVED"], ascending=[False, False], inplace=True)
+        best = cand.iloc[0]
+
+        # Monta um "mini registro" compatível com o bloco de download
+        extras.append({
+            "EMAIL_ENTRY_ID": best["EMAIL_ENTRY_ID"],
+            "EMAIL_RECEIVED": best["EMAIL_RECEIVED"],
+            "KEY_META": key_meta,
+            "Órgão regulador": m["Órgão regulador"],
+            "Tipo_META": m["Tipo"],           # lado META
+            "Número_META": m["Número"],       # lado META
+            "N_NUM_META": m["N_NUM"],         # para anexos/links
+        })
+
+    if extras:
+        extras_df = pd.DataFrame(extras)
+        matched_unique = pd.concat([matched_unique, extras_df], ignore_index=True)
+        matched_unique.drop_duplicates(subset=["KEY_META"], keep="first", inplace=True)
+    # -------------------- FIM DO FALLBACK --------------------
+
     # 5) Download por chave
     ensure_dir(PASTA_DESTINO)
 
@@ -490,8 +573,8 @@ def main():
         tipo_meta  = str(r["Tipo_META"])       # após merge, 'Tipo' das metas vira 'Tipo_META'
         numero_vis = str(r["Número_META"])     # idem para 'Número'
 
-        # nnum deve vir do lado META após o merge (tem sufixo)
-        nnum = str(r.get("N_NUM_META", ""))    # <-- correção principal: usar N_NUM_META
+        # nnum do lado META (com sufixo) – pode não existir em extras? lá adicionamos N_NUM_META.
+        nnum = str(r.get("N_NUM_META", ""))
 
         key    = str(r["KEY_META"])
         base_name = build_output_name_orgao_tipo_num(orgao_meta, tipo_meta, numero_vis)
@@ -550,7 +633,7 @@ def main():
     except Exception as e:
         logging.warning(f"Falha ao salvar saída: {e}")
 
-    logging.info("Processo concluído (v2.3).")
+    logging.info("Processo concluído (v2.4).")
 
 # =========================
 # RUN
