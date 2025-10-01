@@ -119,13 +119,6 @@ def state_add_triplet(state: Dict, orgao: str, tipo: str, nnum: str) -> None:
     if key not in arr:
         arr.append(key)
 
-def file_already_present(dest_dir: str, base_filename: str) -> Optional[str]:
-    base_stem = os.path.splitext(base_filename)[0]
-    for f in os.listdir(dest_dir):
-        if f.lower().endswith(".pdf") and f.lower().startswith(base_stem.lower()):
-            return os.path.join(dest_dir, f)
-    return None
-
 
 # =========================
 # ALIASES & ACRÔNIMOS
@@ -316,9 +309,7 @@ def extract_df_from_email_html(html: str) -> pd.DataFrame:
         mask_headerish = df_tmp["Número"].map(lambda x: N(x) in HEADER_VARIANTS["Número"])
         df_tmp = df_tmp[~mask_headerish].copy()
 
-        # IMPORTANTE: NÃO remover duplicatas apenas por número (pode repetir para órgãos diferentes!)
-        # Aqui mantemos todas as linhas.
-
+        # Mantemos todas as linhas (mesmo Número pode existir para órgãos/tipos diferentes)
         useful_cols = sum(df_tmp[c].notna().any() for c in ["Tipo","Número","Data do Ato","Órgão"])
         score = (useful_cols, len(df_tmp))
         candidates.append((score, df_tmp))
@@ -344,31 +335,31 @@ def add_normalized_cols(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def load_metas_df(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, dtype=str).fillna("")
-    # Se quiser inspecionar visualmente:
+    # DEBUG opcional:
     # print("\n--- Preview METAS (bruto) ---"); print(df.head(10))
 
-    # As colunas corretas e ordem pedida pelo usuário:
     expected_cols = ["Órgão regulador", "Tipo", "Número"]
     for col in expected_cols:
         if col not in df.columns:
             raise RuntimeError(f"Coluna ausente em metas: {col}")
 
+    # Data do ato (opcional)
+    data_col = ""
+    if any(df.columns.str.lower().str.contains("data")):
+        data_col = df.columns[df.columns.str.lower().str.contains("data")][0]
+
     metas = pd.DataFrame({
         "Órgão": df["Órgão regulador"].astype(str),
         "Tipo":   df["Tipo"].astype(str),
         "Número": df["Número"].astype(str),
-        # Data do Ato é opcional no Excel de metas; se existir, trazemos
-        "Data do Ato": df.columns[df.columns.str.lower().str.contains("data")][0]
-                        if any(df.columns.str.lower().str.contains("data")) else ""
+        "Data do Ato": df[data_col].astype(str) if data_col else ""
     })
-    if isinstance(metas["Data do Ato"], str):
-        metas["Data do Ato"] = ""
 
     metas = add_normalized_cols(metas)
     metas["PDF"] = ""      # será preenchido com 'SIM'
     metas["Caminho"] = ""  # caminho do arquivo salvo
 
-    # Se quiser ver as metas normalizadas:
+    # DEBUG opcional:
     # print("\n--- Preview METAS (normalizado) ---"); print(metas.head(10))
 
     return metas
@@ -378,13 +369,10 @@ def load_metas_df(path: str) -> pd.DataFrame:
 # MATCHING
 # =========================
 def row_matches_target(email_row: pd.Series, meta_row: pd.Series) -> bool:
-    # Número deve bater em dígitos
     if str(email_row["N_NUM"]) != str(meta_row["N_NUM"]):
         return False
-    # Órgão: usa aliases/acrônimos e contenções
     if not org_match_loose(email_row["N_ORGAO"], meta_row["N_ORGAO"]):
         return False
-    # Tipo: token principal (RESOLUCAO, DESPACHO, etc.)
     e_tok, t_tok = tipo_main_token(email_row["N_TIPO"]), tipo_main_token(meta_row["N_TIPO"])
     return (t_tok == e_tok) or (t_tok and t_tok in email_row["N_TIPO"]) or (e_tok and e_tok in meta_row["N_TIPO"])
 
@@ -480,10 +468,10 @@ def main():
             continue
 
         df_email = add_normalized_cols(df_email)
-        # NÃO dropar por número — pode repetir entre órgãos diferentes
-        df_email["EMAIL_ENTRY_ID"] = entry_id
-        df_email["EMAIL_SUBJECT"] = subj
-        df_email["EMAIL_RECEIVED"] = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
+        # Garante que os campos de e-mail existam:
+        df_email["EMAIL_ENTRY_ID"]  = entry_id
+        df_email["EMAIL_SUBJECT"]   = subj
+        df_email["EMAIL_RECEIVED"]  = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
 
         email_dfs.append(df_email)
         email_df_map[entry_id] = df_email.copy()
@@ -491,26 +479,29 @@ def main():
 
     if not email_dfs:
         logging.warning("Nenhuma tabela de e-mail extraída. Encerrando.")
-        # Mesmo sem e-mails, gera o Excel final vazio de marcações
         metas_empty = load_metas_df(ARQUIVO_EXCEL_METAS)
         metas_empty[["Órgão","Tipo","Número","PDF","Caminho"]].to_excel(EXCEL_FINAL, index=False)
         logging.info(f"Planilha gerada: {EXCEL_FINAL}")
         return
 
     emails_df_inmem = pd.concat(email_dfs, ignore_index=True)
-
-    # (Opcional) DEBUG – visualizar DataFrame dos e-mails:
+    # DEBUG opcional:
     # print("\n--- Preview EMAILS (normalizado) ---"); print(emails_df_inmem.head(20))
 
     # 2) Metas (fonte da verdade)
     metas_df = load_metas_df(ARQUIVO_EXCEL_METAS)
-    # (Opcional) DEBUG – visualizar DataFrame das metas:
+    # DEBUG opcional:
     # print("\n--- Preview METAS (normalizado) ---"); print(metas_df.head(20))
 
-    # 3) MATCH forte por número e validações auxiliares
+    # 3) MATCH por número com validações auxiliares
     base_join = emails_df_inmem.merge(
         metas_df, how="inner", left_on="N_NUM", right_on="N_NUM", suffixes=("_EMAIL", "_META")
     )
+
+    # Se por algum motivo as colunas de e-mail se sobrepuserem, garantimos que existam:
+    for col in ["EMAIL_ENTRY_ID", "EMAIL_SUBJECT", "EMAIL_RECEIVED"]:
+        if col not in base_join.columns and f"{col}_EMAIL" in base_join.columns:
+            base_join[col] = base_join[f"{col}_EMAIL"]
 
     ok_mask = []
     for _, row in base_join.iterrows():
@@ -526,12 +517,19 @@ def main():
         )
     matched = base_join[ok_mask].copy()
 
-    # 4) Download – evitando duplicidade por (email, órgão, tipo, número)
-    saved_mail_key = set()  # chave: (EMAIL_ENTRY_ID, N(orgao), token(tipo), nnum)
+    # 4) Download – evita duplicidade por (email, órgão, tipo, número)
+    saved_mail_key = set()  # (EMAIL_ENTRY_ID, N(orgao), token(tipo), nnum)
     results = []
 
-    for _, r in matched.sort_values("EMAIL_RECEIVED").iterrows():
-        entry_id = r["EMAIL_ENTRY_ID"]
+    iter_df = matched
+    if "EMAIL_RECEIVED" in iter_df.columns:
+        try:
+            iter_df = iter_df.sort_values("EMAIL_RECEIVED")
+        except Exception:
+            pass  # se a coluna estiver com formato estranho, segue sem ordenar
+
+    for _, r in iter_df.iterrows():
+        entry_id = r.get("EMAIL_ENTRY_ID", "")
         mail = mail_index.get(entry_id)
         if mail is None:
             continue
@@ -546,7 +544,12 @@ def main():
             continue
 
         base_name = build_output_name_orgao_tipo_num(orgao, tipo, numero_vis)
-        fs_hit = file_already_present(PASTA_DESTINO, base_name)
+        fs_hit = None
+        try:
+            fs_hit = file_already_present(PASTA_DESTINO, base_name)
+        except Exception:
+            fs_hit = None
+
         if state_has_triplet(state, orgao, tipo, nnum) or fs_hit:
             saved_mail_key.add(dedup_key)
             results.append({
@@ -580,7 +583,7 @@ def main():
             att.SaveAsFile(dest)
             saved_paths.append(dest)
         else:
-            # 2º: sem número (para casos especiais)
+            # 2º: sem número (casos especiais)
             scored2 = []
             for name, att in all_atts:
                 sc = score_attachment_for_meta(name, orgao, tipo, nnum, require_number=False)
@@ -597,7 +600,7 @@ def main():
                 att.SaveAsFile(dest)
                 saved_paths.append(dest)
             else:
-                # 3º: link com número no corpo (se houver)
+                # 3º: link com número no corpo
                 html = str(getattr(mail, "HTMLBody", "") or "")
                 for url in find_pdf_links_in_html(html, nnum):
                     dest = os.path.join(PASTA_DESTINO, base_name)
@@ -623,23 +626,21 @@ def main():
         })
 
     # 5) Atualiza METAS com PDF/Caminho
+    metas_df = load_metas_df(ARQUIVO_EXCEL_METAS)  # recarrega limpo para escrever o final
     if results:
         df_results = pd.DataFrame(results)
-        # cria chave tripla para marcar na planilha metas
         metas_df["__KEY__"] = metas_df.apply(lambda r: triplet_key(r["Órgão"], r["Tipo"], r["N_NUM"]), axis=1)
         df_results["__KEY__"] = df_results.apply(lambda r: triplet_key(r["orgao"], r["tipo"], r["numero"]), axis=1)
 
-        # consolida caminhos por chave (se houver mais de um)
         agg = (df_results[df_results["status"].isin(["BAIXADO","JA_EXISTIA"])]
                .groupby("__KEY__")["arquivos_salvos"].apply(lambda s: ";".join([x for x in s if x])).to_dict())
 
-        # marca PDF=SIM e Caminho
         metas_df.loc[metas_df["__KEY__"].isin(agg.keys()), "PDF"] = "SIM"
         metas_df.loc[metas_df["__KEY__"].isin(agg.keys()), "Caminho"] = metas_df["__KEY__"].map(agg)
 
         metas_df.drop(columns=["__KEY__"], inplace=True, errors="ignore")
 
-    # 6) Log CSV (continua existindo, mas não geramos outros Excel)
+    # 6) Log CSV (permanece; apenas não geramos outros Excel)
     try:
         if results:
             df_log = pd.DataFrame(results)
