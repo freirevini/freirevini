@@ -1,120 +1,684 @@
-import win32com.client
-from datetime import datetime, timedelta
-import pandas as pd
-from bs4 import BeautifulSoup
+# -*- coding: utf-8 -*-
 import os
+import re
+import logging
+import pathlib
+import datetime as dt
+from typing import List, Dict, Optional, Tuple
 
-# Parâmetros de filtro
-data_inicio = "01/03/2025"
-data_fim = "07/03/2025"
-remetente_filtro = "informe@mkcompliance.com.br"
-assunto_fixo = "[EXT] - Normativos Divulgados em "
+import win32com.client as win32
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from dateutil import parser as dtparser
 
-# Pasta de destino (onde serão salvos o Excel e os anexos)
-pasta_destino = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook"
-arquivo_excel = os.path.join(pasta_destino, "Normativos.xlsx")
+# =========================
+# CONFIG
+# =========================
+# TESTE – ajuste o intervalo:
+DATA_INICIO = "01/03/2025"
+DATA_FIM    = "07/03/2025"
+# PRODUÇÃO (últimos 3 dias):
+# _hoje = dt.datetime.today()
+# DATA_INICIO, DATA_FIM = (_hoje - dt.timedelta(days=3)).strftime("%d/%m/%Y"), _hoje.strftime("%d/%m/%Y")
 
-# Conectar ao Outlook
-outlook = win32com.client.Dispatch("Outlook.Application")
-namespace = outlook.GetNamespace("MAPI")
+REMETENTE_FILTRO = "informe@mkcompliance.com.br"
+ASSUNTO_FIXO = "[EXT] - Normativos Divulgados em "
+OUTLOOK_FOLDER_PATH = r"Caixa de Entrada\Normas MK Compliance"
 
-# Acessar a caixa de entrada (6 = olFolderInbox)
-caixa_entrada = namespace.GetDefaultFolder(6)
+# Pasta onde os PDFs serão salvos
+PASTA_DESTINO = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Normativo_Download_Outlook"
 
-# Converter datas para datetime (Python)
-data_inicio_dt = datetime.strptime(data_inicio, "%d/%m/%Y")
-data_fim_dt = datetime.strptime(data_fim, "%d/%m/%Y")
+# Caminho da planilha de Metas (fonte e local da planilha de saída)
+ARQUIVO_EXCEL_METAS  = r"N:\DCGV\Compliance\Compliance RO Varejo\Analytics\Projetos\AgendaNormativa\Melhorias_Agenda\3_BaseMK\BaseMkNormasParaAvaliar.xlsx"
 
-# Formatar datas para o filtro do Outlook (MM/DD/YYYY)
-data_inicio_fmt = data_inicio_dt.strftime("%m/%d/%Y")
-data_fim_fmt = data_fim_dt.strftime("%m/%d/%Y")
+# Arquivo de saída: será criado na MESMA PASTA do arquivo de metas
+NOME_ARQ_SAIDA = "Normas_Status_Download.xlsx"
+ARQ_SAIDA = os.path.join(os.path.dirname(ARQUIVO_EXCEL_METAS), NOME_ARQ_SAIDA)
 
-# Montar filtro para ReceivedTime (data de recebimento)
-filtro_data = f"[ReceivedTime] >= '{data_inicio_fmt} 00:00 AM' AND [ReceivedTime] <= '{data_fim_fmt} 11:59 PM'"
+HTTP_TIMEOUT = 45
+LOG_LEVEL = logging.INFO
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Montar filtro para Subject (data no assunto, no formato dd/mm/yyyy)
-# Aqui fazemos uma comparação de string (lexicográfica). 
-# Ex.: "[EXT] - Normativos Divulgados em 01/03/2025" até "[EXT] - Normativos Divulgados em 07/03/2025"
-assunto_inicio = assunto_fixo + data_inicio_dt.strftime("%d/%m/%Y")
-assunto_fim = assunto_fixo + data_fim_dt.strftime("%d/%m/%Y")
-filtro_assunto = f"[Subject] >= '{assunto_inicio}' AND [Subject] <= '{assunto_fim}'"
+# =========================
+# HELPERS
+# =========================
+def ensure_dir(path: str | pathlib.Path) -> None:
+    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
 
-# Combinar os dois filtros (ReceivedTime e Subject)
-filtro_combinado = f"({filtro_data}) AND ({filtro_assunto})"
+def N(txt: str) -> str:
+    import unicodedata
+    txt = str(txt or "")
+    txt = "".join(c for c in unicodedata.normalize("NFKD", txt) if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", txt.upper().strip())
 
-# Obter os e-mails que satisfazem o filtro
-emails = caixa_entrada.Items.Restrict(filtro_combinado)
+def only_digits(s: str) -> str:
+    return re.sub(r"\D", "", str(s or ""))
 
-# Lista para consolidar tabelas de múltiplos e-mails
-tabelas = []
+def parse_date_flexible(s: str) -> Optional[dt.date]:
+    if not s:
+        return None
+    s = str(s).strip()
+    try:
+        return dtparser.parse(s, dayfirst=True).date()
+    except Exception:
+        pass
+    m = re.search(r"(\d{1,2})\s+de\s+([a-zç\.]+)\s+de\s+(\d{4})", s, flags=re.IGNORECASE)
+    if m:
+        d = int(m.group(1))
+        mes_raw = m.group(2).replace(".", "").lower()
+        mapa = {
+            "jan":1,"janeiro":1,"fev":2,"fevereiro":2,"mar":3,"marco":3,"março":3,"abr":4,"abril":4,
+            "mai":5,"maio":5,"jun":6,"junho":6,"jul":7,"julho":7,"ago":8,"agosto":8,"set":9,"setembro":9,
+            "out":10,"outubro":10,"nov":11,"novembro":11,"dez":12,"dezembro":12
+        }
+        mes = mapa.get(mes_raw, 0)
+        y = int(m.group(3))
+        if 1 <= int(mes) <= 12:
+            return dt.date(y, int(mes), d)
+    return None
 
-# Lista para armazenar os assuntos dos e-mails identificados
-emails_identificados = []
+def sanitize_filename(s: str) -> str:
+    s = re.sub(r"[^\w\-. ]", "_", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("._")[:180]
 
-# Colunas esperadas
-colunas_desejadas = ["Tipo", "Número", "Data do Ato", "Órgão", "Ementa", "Vigência"]
+def build_output_name_orgao_tipo_num(orgao: str, tipo: str, numero: str) -> str:
+    base = f"{orgao}_{tipo}_{only_digits(numero)}"
+    return sanitize_filename(base) + ".pdf"
 
-for email in emails:
-    # Verificar também o remetente
-    if remetente_filtro.lower() in email.SenderEmailAddress.lower():
-        # Tentar extrair a data do assunto (ex.: "Normativos Divulgados em 06/03/2025")
-        if email.Subject.startswith(assunto_fixo):
-            try:
-                data_str = email.Subject.replace(assunto_fixo, "").strip()
-                data_no_assunto = datetime.strptime(data_str, "%d/%m/%Y")
-            except ValueError:
-                # Se não conseguir processar a data do assunto, ignora
+def file_already_present(dest_dir: str, base_filename: str) -> Optional[str]:
+    base_stem = os.path.splitext(base_filename)[0]
+    for f in os.listdir(dest_dir):
+        if f.lower().endswith(".pdf") and f.lower().startswith(base_stem.lower()):
+            return os.path.join(dest_dir, f)
+    return None
+
+def keyify(orgao_norm: str, tipo_norm: str, nnum: str) -> str:
+    """
+    CHAVE composta: ORGAO_TIPO_NUMERO (tudo normalizado), ex.: BANCO_CENTRAL_DO_BRASIL_COMUNICADO_4923
+    """
+    def to_key_part(s: str) -> str:
+        s = re.sub(r"[^\w]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s
+    return "_".join(filter(None, [to_key_part(orgao_norm), to_key_part(tipo_norm), to_key_part(nnum)]))
+
+# =========================
+# OUTLOOK
+# =========================
+def open_outlook_folder_by_path(path_str: str):
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    parts = [p for p in path_str.split("\\") if p.strip()]
+    if not parts:
+        return ns.GetDefaultFolder(6)  # Inbox
+
+    root = None
+    first = parts[0]
+    for i in range(1, ns.Folders.Count + 1):
+        store = ns.Folders.Item(i)
+        if str(store.Name).strip().lower() == first.strip().lower():
+            root = store
+            parts = parts[1:]
+            break
+
+    if root is None:
+        root = ns.GetDefaultFolder(6)
+    # se o primeiro for Inbox/Caixa de Entrada, ajusta
+    if parts and parts[0].strip().lower() in ["inbox", "caixa de entrada"]:
+        parts = parts[1:]
+
+    folder = root
+    for p in parts:
+        folder = folder.Folders.Item(p)
+    return folder
+
+def restrict_by_date_and_subject(items, data_inicio_dt: dt.datetime, data_fim_dt: dt.datetime) -> list:
+    """
+    NOVA LÓGICA (baseada no seu código parâmetro):
+    - Usa Items.Restrict com filtro combinado:
+        (ReceivedTime dentro do intervalo) AND
+        (Subject entre "[EXT] - Normativos Divulgados em dd/mm/aaaa" do início e do fim)
+    - Depois ainda valida remetente e assunto+data.
+    - Imprime os filtros usados e os totais em cada passo.
+    """
+    # 1) Formatos de datas
+    di_fmt_us = data_inicio_dt.strftime("%m/%d/%Y")
+    df_fmt_us = data_fim_dt.strftime("%m/%d/%Y")
+    di_br = data_inicio_dt.strftime("%d/%m/%Y")
+    df_br = data_fim_dt.strftime("%d/%m/%Y")
+
+    # 2) Filtros DASL do Outlook
+    filtro_data = f"[ReceivedTime] >= '{di_fmt_us} 00:00 AM' AND [ReceivedTime] <= '{df_fmt_us} 11:59 PM'"
+    assunto_inicio = f"{ASSUNTO_FIXO}{di_br}"
+    assunto_fim    = f"{ASSUNTO_FIXO}{df_br}"
+    filtro_assunto = f"[Subject] >= '{assunto_inicio}' AND [Subject] <= '{assunto_fim}'"
+    filtro_combinado = f"({filtro_data}) AND ({filtro_assunto})"
+
+    # 3) Prints/Logs dos filtros
+    print(">>> Filtro Outlook - ReceivedTime:", filtro_data)
+    print(">>> Filtro Outlook - Subject:", filtro_assunto)
+    print(">>> Filtro Outlook - COMBINADO:", filtro_combinado)
+    logging.info(f"Filtro Outlook - ReceivedTime: {filtro_data}")
+    logging.info(f"Filtro Outlook - Subject: {filtro_assunto}")
+    logging.info(f"Filtro Outlook - COMBINADO: {filtro_combinado}")
+
+    # 4) Restrict
+    try:
+        items.Sort("[ReceivedTime]", True)
+    except Exception:
+        pass
+    try:
+        restricted = items.Restrict(filtro_combinado)
+        # Força materializar em lista para poder contar
+        candidates = list(restricted)
+    except Exception as e:
+        print(f"[Restrict ERROR] {e}")
+        logging.warning(f"Restrict error: {e}")
+        candidates = []
+
+    print(f">>> Emails após Restrict (combinação): {len(candidates)}")
+    logging.info(f"Emails após Restrict (combinação): {len(candidates)}")
+
+    # 5) Validação final por remetente e por assunto (startswith + data no assunto no intervalo)
+    out = []
+    for mail in candidates:
+        try:
+            subj = str(getattr(mail, "Subject", "") or "").strip()
+            from_addr = str(getattr(mail, "SenderEmailAddress", "") or "").lower()
+            if REMETENTE_FILTRO.lower() not in from_addr:
+                continue
+            if not subj.startswith(ASSUNTO_FIXO):
                 continue
 
-            # Verificar se a data do assunto está no intervalo desejado
-            # (Boa prática para garantir que a comparação lexicográfica não traga dados fora)
+            # extrai a data do assunto
+            data_str = subj.replace(ASSUNTO_FIXO, "").strip()
+            try:
+                data_no_assunto = dt.datetime.strptime(data_str, "%d/%m/%Y")
+            except Exception:
+                continue
+
             if data_inicio_dt <= data_no_assunto <= data_fim_dt:
-                
-                emails_identificados.append(email.Subject)
+                out.append(mail)
+        except Exception:
+            continue
 
-                # 1) Download de todos os anexos do e-mail
-                if email.Attachments.Count > 0:
-                    for anexo in email.Attachments:
-                        anexo_path = os.path.join(pasta_destino, anexo.FileName)
-                        try:
-                            anexo.SaveAsFile(anexo_path)
-                        except Exception as e:
-                            print(f"Erro ao salvar anexo {anexo.FileName}: {e}")
+    print(f">>> Emails após validar remetente/assunto: {len(out)}")
+    logging.info(f"Emails após validar remetente/assunto: {len(out)}")
+    # lista os assuntos para conferência
+    for m in out:
+        try:
+            print("   -", str(getattr(m, "Subject", "") or ""))
+        except Exception:
+            pass
 
-                # 2) Processar o HTML do corpo do e-mail para extrair a tabela
-                html_corpo = email.HTMLBody
-                soup = BeautifulSoup(html_corpo, "html.parser")
+    return out
 
-                for table in soup.find_all("table"):
-                    try:
-                        # Lê a tabela com a primeira linha como cabeçalho
-                        df_list = pd.read_html(str(table), header=0)
-                    except ValueError:
-                        continue  # Caso não haja tabelas legíveis
+# =========================
+# EMAIL HTML -> DATAFRAME CANÔNICO
+# =========================
+COLS_CANON = ["Tipo", "Número", "Data do Ato", "Órgão", "Ementa", "Vigência"]
 
-                    for df_temp in df_list:
-                        # Verifica se a tabela possui todas as colunas desejadas
-                        if set(colunas_desejadas).issubset(df_temp.columns):
+HEADER_VARIANTS = {
+    "Órgão": {N("Órgão"), N("Órgão regulador"), N("Orgao"), N("Orgao Regulador"), N("Orgão Regulador"), N("Órgão Responsável"), N("Orgão Responsável")},
+    "Tipo": {N("Tipo"), N("Tipo da Norma"), N("Espécie"), N("Especie")},
+    "Número": {N("Número"), N("Numero"), N("Nº"), N("No"), N("N."), N("N")},
+    "Data do Ato": {N("Data do Ato"), N("Data do Normativo"), N("Data"), N("Publicação"), N("Data Publicação")},
+    "Ementa": {N("Ementa"), N("Assunto"), N("Resumo"), N("Descrição"), N("Descricao")},
+    "Vigência": {N("Vigência"), N("Vigencia")},
+}
 
-                            # Cria coluna "data de processamento" (data/hora do recebimento)
-                            df_temp["data de processamento"] = data_no_assunto
+FORWARD_MARKERS = re.compile(
+    r"(mensagem encaminhada|encaminhada|enc:|fw:|forwarded message|-----+ original message -----+)",
+    re.I
+)
 
-                            # (Opcional) Manter somente as colunas desejadas + data de processamento
-                            df_temp = df_temp[colunas_desejadas + ["data de processamento"]]
+def _row_cells(tr) -> list[str]:
+    tds = tr.find_all(["td", "th"])
+    return [td.get_text(" ", strip=True) for td in tds]
 
-                            # Adiciona o DataFrame resultante à lista geral
-                            tabelas.append(df_temp)
+def _header_mapping(cells_norm: list[str]) -> Dict[int, str]:
+    idx_to_key = {}
+    for i, txt in enumerate(cells_norm):
+        for canon, variants in HEADER_VARIANTS.items():
+            if txt in variants and canon not in idx_to_key.values():
+                idx_to_key[i] = canon
+                break
+    return idx_to_key
 
+def _scan_table_for_header(table) -> Optional[Tuple[Dict[int, str], int, list]]:
+    trs = table.find_all("tr")
+    if not trs:
+        return None
+    best = None
+    for idx, tr in enumerate(trs):
+        cells = _row_cells(tr)
+        cells_norm = [N(c) for c in cells]
+        mapping = _header_mapping(cells_norm)
+        keys = set(mapping.values())
+        if ("Número" in keys) and (("Tipo" in keys) or ("Órgão" in keys)) and len(keys) >= 4:
+            score = (len(keys),)
+            if (best is None) or (score > best[0]):
+                best = (score, mapping, idx, trs)
+    if best is None:
+        return None
+    _, mapping, idx, trs = best
+    return mapping, idx, trs
 
-#Print
-print("E-mails identificados:")
-for assunto in emails_identificados:
-    print(assunto)
-                            
-# 3) Consolidação e salvamento no Excel
-if tabelas:
-    df_final = pd.concat(tabelas, ignore_index=True)
-    df_final.to_excel(arquivo_excel, index=False)
-    print(f"Arquivo Excel gerado com sucesso: {arquivo_excel}")
-else:
-    print("Nenhuma tabela encontrada nos e-mails filtrados.")
+def extract_df_from_email_html(html: str) -> pd.DataFrame:
+    if not html:
+        return pd.DataFrame(columns=COLS_CANON)
+
+    cut_html = html
+    m = FORWARD_MARKERS.search(html)
+    if m:
+        cut_html = html[:m.start()]
+
+    soup = BeautifulSoup(cut_html, "lxml")
+    candidates: list[tuple[Tuple[int, int], pd.DataFrame]] = []
+
+    for table in soup.find_all("table"):
+        header_scan = _scan_table_for_header(table)
+        if not header_scan:
+            continue
+        idx_to_key, idx_header, trs = header_scan
+
+        records = []
+        for tr in trs[idx_header+1:]:
+            cells = _row_cells(tr)
+            if not cells:
+                continue
+            row = {k: "" for k in COLS_CANON}
+            for i, canon in idx_to_key.items():
+                if i < len(cells):
+                    row[canon] = cells[i]
+            if only_digits(row.get("Número", "")):
+                records.append(row)
+
+        if not records:
+            continue
+
+        df_tmp = pd.DataFrame.from_records(records, columns=COLS_CANON)
+        for c in COLS_CANON:
+            df_tmp[c] = df_tmp[c].fillna("").astype(str).str.replace("\xa0", " ", regex=False).str.strip()
+
+        mask_headerish = df_tmp["Número"].map(lambda x: N(x) in HEADER_VARIANTS["Número"])
+        df_tmp = df_tmp[~mask_headerish].copy()
+
+        df_tmp["__N_NUM__"] = df_tmp["Número"].map(only_digits)
+        df_tmp = df_tmp.drop_duplicates(subset=["__N_NUM__"], keep="first").drop(columns=["__N_NUM__"])
+
+        useful_cols = sum(df_tmp[c].notna().any() for c in ["Tipo","Número","Data do Ato","Órgão"])
+        score = (useful_cols, len(df_tmp))
+        candidates.append((score, df_tmp))
+
+    if not candidates:
+        return pd.DataFrame(columns=COLS_CANON)
+
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    best_df = candidates[0][1].copy()
+    return best_df[COLS_CANON].reset_index(drop=True)
+
+def add_normalized_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in ["Tipo","Número","Órgão","Data do Ato"]:
+        if c not in out.columns:
+            out[c] = ""
+        out[c] = out[c].fillna("").astype(str)
+
+    out["N_TIPO"] = out["Tipo"].map(N)
+    out["N_NUM"] = out["Número"].map(only_digits)
+    out["N_ORGAO"] = out["Órgão"].map(N)
+    out["DATA_ATO_DT"] = out["Data do Ato"].map(parse_date_flexible)
+
+    # CHAVE composta dos e-mails
+    out["KEY_EMAIL"] = out.apply(lambda r: keyify(r["N_ORGAO"], r["N_TIPO"], r["N_NUM"]), axis=1)
+    return out
+
+# =========================
+# METAS (EXCEL) — mapeamento amplo
+# =========================
+def load_metas_df(path: str) -> pd.DataFrame:
+    df = pd.read_excel(path).fillna("")
+    variants = {
+        "Órgão regulador": {"Órgão regulador","Órgão","Orgao","Orgão Regulador","Orgao Regulador","Órgão Regulador"},
+        "Tipo": {"Tipo","Tipo da Norma","Espécie","Especie"},
+        "Número": {"Número","Numero","Nº","No","N.","N"},
+        "Data do Normativo": {"Data do Normativo","Data do Ato","Data","Publicação","Data Publicação"},
+        "Ementa": {"Ementa","Assunto","Resumo","Descrição","Descricao"},
+        "Data de inicio de vigência": {"Data de inicio de vigência","Data de início de vigência","Início de Vigência","Data início de vigência","Data Inicio Vigencia"},
+        "Vigência": {"Vigência","Vigencia"},
+        "Data de inclusão no MKCompliance": {"Data de inclusão no MKCompliance","Inclusão MKCompliance","Data Inclusão MK"}
+    }
+
+    colnorm = {N(c): c for c in df.columns}
+
+    def pick(canon: str) -> Optional[str]:
+        for v in variants.get(canon, {canon}):
+            if N(v) in colnorm:
+                return colnorm[N(v)]
+        return None
+
+    c_org  = pick("Órgão regulador")
+    c_tipo = pick("Tipo")
+    c_num  = pick("Número")
+    c_data = pick("Data do Normativo")
+    c_ementa   = pick("Ementa")
+    c_vig_ini  = pick("Data de inicio de vigência")
+    c_vig      = pick("Vigência")
+    c_inc_mk   = pick("Data de inclusão no MKCompliance")
+
+    miss = [n for n,v in [("Órgão regulador",c_org),("Tipo",c_tipo),("Número",c_num),("Data do Normativo",c_data)] if v is None]
+    if miss:
+        raise RuntimeError(f"Colunas ausentes na planilha de metas: {miss}")
+
+    metas = pd.DataFrame({
+        "Órgão regulador": df[c_org].astype(str),
+        "Tipo":            df[c_tipo].astype(str),
+        "Número":          df[c_num].astype(str),
+        "Data do Normativo": df[c_data].astype(str),
+        "Ementa": df[c_ementa].astype(str) if c_ementa else "",
+        "Data de inicio de vigência": df[c_vig_ini].astype(str) if c_vig_ini else "",
+        "Vigência": df[c_vig].astype(str) if c_vig else "",
+        "Data de inclusão no MKCompliance": df[c_inc_mk].astype(str) if c_inc_mk else "",
+    })
+
+    # normalizados para chave
+    metas["N_TIPO_META"]   = metas["Tipo"].map(N)
+    metas["N_NUM"]         = metas["Número"].map(only_digits)
+    metas["N_ORGAO_META"]  = metas["Órgão regulador"].map(N)
+    metas["KEY_META"]      = metas.apply(lambda r: keyify(r["N_ORGAO_META"], r["N_TIPO_META"], r["N_NUM"]), axis=1)
+
+    # remove duplicidades explícitas na própria planilha
+    metas = metas.drop_duplicates(subset=["KEY_META"], keep="first").reset_index(drop=True)
+    return metas
+
+# =========================
+# AJUDA PARA FALLBACK (match relaxado por número + órgão/tipo)
+# =========================
+def email_matches_meta_relaxed(email_row: pd.Series, meta_row: pd.Series) -> tuple[int, bool]:
+    """
+    Compara por NÚMERO e valida ÓRGÃO/TIPO de forma flexível.
+    Retorna (score, ok) onde score = 2 (match perfeito de tipo),
+    1 (match parcial por prefixo/contém) ou 0 (sem match).
+    """
+    if str(email_row.get("N_NUM", "")) != str(meta_row.get("N_NUM", "")):
+        return 0, False
+
+    e_org = str(email_row.get("N_ORGAO", ""))
+    t_org = str(meta_row.get("N_ORGAO_META", ""))
+    org_ok = any(alias in e_org for alias in [t_org, "BANCO CENTRAL", "BANCO CENTRAL DO BRASIL", "BCB", "BACEN", "CVM", "ANBIMA", "CMN"])
+    if not org_ok:
+        return 0, False
+
+    e_tipo = str(email_row.get("N_TIPO", ""))
+    t_tipo = str(meta_row.get("N_TIPO_META", ""))
+    if not e_tipo or not t_tipo:
+        return 0, False
+
+    if t_tipo == e_tipo:
+        return 2, True
+    if t_tipo.split()[0] in e_tipo or e_tipo in t_tipo:
+        return 1, True
+
+    return 0, False
+
+# =========================
+# PDF DOWNLOAD
+# =========================
+def find_pdf_attachments(mail, number_digits: str, tipo_norm: str | None = None) -> List[Tuple[str, object]]:
+    found = []
+    try:
+        cnt = int(getattr(mail.Attachments, "Count", 0))
+        for i in range(1, cnt + 1):
+            att = mail.Attachments.Item(i)
+            name = str(getattr(att, "FileName", "") or "")
+            if not name.lower().endswith(".pdf"):
+                continue
+            n_ok = number_digits in N(name)
+            if not n_ok:
+                continue
+            if tipo_norm:
+                if N(tipo_norm).split()[0] not in N(name):
+                    found.append((name, att))
+                else:
+                    found.insert(0, (name, att))
+            else:
+                found.append((name, att))
+    except Exception as e:
+        logging.warning(f"Erro ao ler anexos: {e}")
+    return found
+
+def find_pdf_links_in_html(html: str, number_digits: str) -> List[str]:
+    links = []
+    if not html:
+        return links
+    soup = BeautifulSoup(html, "lxml")
+    for a in soup.find_all("a"):
+        href = (a.get("href") or "").strip()
+        if href.lower().endswith(".pdf") and number_digits in N(href):
+            links.append(href)
+    return links
+
+def download_link(url: str, dest_path: str) -> bool:
+    try:
+        r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        if r.status_code >= 400:
+            return False
+        with open(dest_path, "wb") as f:
+            f.write(r.content)
+        return True
+    except Exception as e:
+        logging.warning(f"Falha no download {url}: {e}")
+        return False
+
+# =========================
+# PIPELINE
+# =========================
+def main():
+    ensure_dir(PASTA_DESTINO)
+
+    # 1) Ler e-mails do Outlook (apenas em memória)
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    folder = open_outlook_folder_by_path(OUTLOOK_FOLDER_PATH)
+    items = folder.Items
+    # sort redundante; dentro da restrict já tento de novo
+    try:
+        items.Sort("[ReceivedTime]", True)
+    except Exception:
+        pass
+
+    di = dt.datetime.strptime(DATA_INICIO, "%d/%m/%Y")
+    df_ = dt.datetime.strptime(DATA_FIM, "%d/%m/%Y")
+    mails = restrict_by_date_and_subject(items, di, df_)
+    logging.info(f"E-mails elegíveis após todos os filtros: {len(mails)}")
+
+    email_dfs = []
+    mail_index: Dict[str, object] = {}
+
+    for mail in mails:
+        entry_id = str(getattr(mail, "EntryID", ""))
+        subj = str(getattr(mail, "Subject", "") or "")
+        recd = getattr(mail, "ReceivedTime", None)
+        html = str(getattr(mail, "HTMLBody", "") or "")
+
+        df_email = extract_df_from_email_html(html)
+        if df_email.empty:
+            logging.info(f"[SKIP] Sem tabela reconhecida em: {subj}")
+            continue
+
+        df_email = add_normalized_cols(df_email)
+        df_email = df_email.drop_duplicates(subset=["KEY_EMAIL"], keep="first").reset_index(drop=True)
+
+        df_email["EMAIL_ENTRY_ID"] = entry_id
+        df_email["EMAIL_SUBJECT"] = subj
+        df_email["EMAIL_RECEIVED"] = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
+
+        email_dfs.append(df_email)
+        mail_index[entry_id] = mail
+
+    # 2) Carregar METAS (fonte de verdade para seleção do que baixar)
+    metas_df = load_metas_df(ARQUIVO_EXCEL_METAS)
+    logging.info(f"Metas carregadas: {len(metas_df)}")
+
+    if not email_dfs:
+        logging.warning("Nenhuma tabela de e-mail extraída. Encerrando.")
+        saida = metas_df.copy()
+        saida["PDF"] = "Não"
+        saida["Caminho"] = ""
+        saida.to_excel(ARQ_SAIDA, index=False)
+        logging.info(f"Saída gerada (sem e-mails): {ARQ_SAIDA}")
+        return
+
+    emails_df = pd.concat(email_dfs, ignore_index=True)
+
+    # 3) JOIN por CHAVE composta (KEY_EMAIL vs KEY_META) — metas como parâmetro
+    base_join = emails_df.merge(
+        metas_df,
+        how="inner",
+        left_on="KEY_EMAIL",
+        right_on="KEY_META",
+        suffixes=("_EMAIL", "_META")
+    )
+    if base_join.empty:
+        logging.info("Nenhuma chave coincidente entre e-mails e metas.")
+        saida = metas_df.copy()
+        saida["PDF"] = "Não"
+        saida["Caminho"] = ""
+        saida.to_excel(ARQ_SAIDA, index=False)
+        logging.info(f"Saída gerada (sem matches): {ARQ_SAIDA}")
+        return
+
+    logging.info(f"Matches por chave: {len(base_join)}")
+
+    # 4) Se mesmo KEY aparecer em múltiplos e-mails, prioriza o mais recente
+    base_join.sort_values(
+        by=["KEY_META", "EMAIL_RECEIVED"],
+        ascending=[True, False],
+        inplace=True
+    )
+    matched_unique = base_join.drop_duplicates(subset=["KEY_META"], keep="first").copy()
+
+    # -------------------- FALLBACK: NÚMERO + validação flexível de Órgão/Tipo --------------------
+    matched_keys = set(matched_unique["KEY_META"].astype(str))
+
+    extras = []
+    for _, m in metas_df.iterrows():
+        key_meta = str(m["KEY_META"])
+        if key_meta in matched_keys:
+            continue  # já casou pelo join exato de KEY
+
+        nnum_meta = str(m["N_NUM"])
+        cand = emails_df[emails_df["N_NUM"].astype(str) == nnum_meta].copy()
+        if cand.empty:
+            continue
+
+        def _score_row(e):
+            score, ok = email_matches_meta_relaxed(
+                pd.Series({"N_NUM": e["N_NUM"], "N_ORGAO": e["N_ORGAO"], "N_TIPO": e["N_TIPO"]}),
+                pd.Series({"N_NUM": m["N_NUM"], "N_ORGAO_META": m["N_ORGAO_META"], "N_TIPO_META": m["N_TIPO_META"]})
+            )
+            return score if ok else 0
+
+        cand["__score__"] = cand.apply(_score_row, axis=1)
+        cand = cand[cand["__score__"] > 0]
+        if cand.empty:
+            continue
+
+        cand.sort_values(by=["__score__", "EMAIL_RECEIVED"], ascending=[False, False], inplace=True)
+        best = cand.iloc[0]
+
+        extras.append({
+            "EMAIL_ENTRY_ID": best["EMAIL_ENTRY_ID"],
+            "EMAIL_RECEIVED": best["EMAIL_RECEIVED"],
+            "KEY_META": key_meta,
+            "Órgão regulador": m["Órgão regulador"],
+            "Tipo_META": m["Tipo"],
+            "Número_META": m["Número"],
+            "N_NUM_META": m["N_NUM"],
+        })
+
+    if extras:
+        extras_df = pd.DataFrame(extras)
+        matched_unique = pd.concat([matched_unique, extras_df], ignore_index=True)
+        matched_unique.drop_duplicates(subset=["KEY_META"], keep="first", inplace=True)
+    # -------------------- FIM DO FALLBACK --------------------
+
+    # 5) Download por chave
+    ensure_dir(PASTA_DESTINO)
+
+    dl_map: Dict[str, str] = {}
+
+    for _, r in matched_unique.iterrows():
+        entry_id = str(r["EMAIL_ENTRY_ID"])
+        mail = mail_index.get(entry_id)
+        if mail is None:
+            continue
+
+        orgao_meta = str(r["Órgão regulador"])
+        tipo_meta  = str(r["Tipo_META"])
+        numero_vis = str(r["Número_META"])
+        nnum = str(r.get("N_NUM_META", ""))
+
+        key    = str(r["KEY_META"])
+        base_name = build_output_name_orgao_tipo_num(orgao_meta, tipo_meta, numero_vis)
+
+        fs_hit = file_already_present(PASTA_DESTINO, base_name)
+        if fs_hit:
+            dl_map[key] = fs_hit
+            continue
+
+        saved_path = ""
+
+        for name, att in find_pdf_attachments(mail, nnum, tipo_norm=tipo_meta):
+            dest = os.path.join(PASTA_DESTINO, base_name)
+            k = 1
+            while os.path.exists(dest):
+                dest = os.path.join(PASTA_DESTINO, sanitize_filename(os.path.splitext(base_name)[0] + f"_{k}.pdf"))
+                k += 1
+            att.SaveAsFile(dest)
+            saved_path = dest
+            break
+
+        if not saved_path:
+            html = str(getattr(mail, "HTMLBody", "") or "")
+            for url in find_pdf_links_in_html(html, nnum):
+                dest = os.path.join(PASTA_DESTINO, base_name)
+                k = 1
+                while os.path.exists(dest):
+                    dest = os.path.join(PASTA_DESTINO, sanitize_filename(os.path.splitext(base_name)[0] + f"_{k}.pdf"))
+                    k += 1
+                if download_link(url, dest):
+                    saved_path = dest
+                    break
+
+        if saved_path:
+            dl_map[key] = saved_path
+
+    # 6) Monta a planilha de SAÍDA com base na planilha de Metas
+    saida = metas_df.copy()
+    saida["PDF"] = "Não"
+    saida["Caminho"] = ""
+
+    for idx, row in saida.iterrows():
+        key = row["KEY_META"]
+        path = dl_map.get(key, "")
+        if path and os.path.exists(path):
+            saida.at[idx, "PDF"] = "Sim"
+            saida.at[idx, "Caminho"] = path
+
+    # 7) Salva APENAS o Excel de saída na pasta da planilha de metas
+    try:
+        saida.to_excel(ARQ_SAIDA, index=False)
+        logging.info(f"Saída gerada: {ARQ_SAIDA}")
+    except Exception as e:
+        logging.warning(f"Falha ao salvar saída: {e}")
+
+    logging.info("Processo concluído (v2.5).")
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    main()
