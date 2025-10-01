@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+# v2.6 — filtro de emails apenas por ASSUNTO (OR por igualdade em chunks),
+# mantendo chave composta (Órgão+Tipo+Número) e fallback por Número.
+
 import os
 import re
 import logging
@@ -136,52 +139,69 @@ def open_outlook_folder_by_path(path_str: str):
 
 def restrict_by_date_and_subject(items, data_inicio_dt: dt.datetime, data_fim_dt: dt.datetime) -> list:
     """
-    NOVA LÓGICA (baseada no seu código parâmetro):
-    - Usa Items.Restrict com filtro combinado:
-        (ReceivedTime dentro do intervalo) AND
-        (Subject entre "[EXT] - Normativos Divulgados em dd/mm/aaaa" do início e do fim)
-    - Depois ainda valida remetente e assunto+data.
-    - Imprime os filtros usados e os totais em cada passo.
+    Pesquisa SOMENTE por Subject, sem intervalo lexicográfico.
+    - Monta a lista de assuntos esperados (um por dia).
+    - Faz Restrict com OR de igualdades: ([Subject] = '...') OR ([Subject] = '...') ...
+    - Faz em chunks para evitar filtro muito longo.
+    - Depois valida remetente e assunto/data.
     """
-    # 1) Formatos de datas
-    di_fmt_us = data_inicio_dt.strftime("%m/%d/%Y")
-    df_fmt_us = data_fim_dt.strftime("%m/%d/%Y")
-    di_br = data_inicio_dt.strftime("%d/%m/%Y")
-    df_br = data_fim_dt.strftime("%d/%m/%Y")
+    # 1) Monta a lista de assuntos esperados (um por dia, inclusivo)
+    expected_subjects = []
+    days = (data_fim_dt.date() - data_inicio_dt.date()).days
+    for i in range(days + 1):
+        d = (data_inicio_dt + dt.timedelta(days=i)).strftime("%d/%m/%Y")
+        expected_subjects.append(f"{ASSUNTO_FIXO}{d}")
 
-    # 2) Filtros DASL do Outlook
-    filtro_data = f"[ReceivedTime] >= '{di_fmt_us} 00:00 AM' AND [ReceivedTime] <= '{df_fmt_us} 11:59 PM'"
-    assunto_inicio = f"{ASSUNTO_FIXO}{di_br}"
-    assunto_fim    = f"{ASSUNTO_FIXO}{df_br}"
-    filtro_assunto = f"[Subject] >= '{assunto_inicio}' AND [Subject] <= '{assunto_fim}'"
-    filtro_combinado = f"({filtro_data}) AND ({filtro_assunto})"
+    print(">>> Assuntos esperados (por dia):")
+    for s in expected_subjects:
+        print("   -", s)
+    logging.info(f"Total de assuntos esperados: {len(expected_subjects)}")
 
-    # 3) Prints/Logs dos filtros
-    print(">>> Filtro Outlook - ReceivedTime:", filtro_data)
-    print(">>> Filtro Outlook - Subject:", filtro_assunto)
-    print(">>> Filtro Outlook - COMBINADO:", filtro_combinado)
-    logging.info(f"Filtro Outlook - ReceivedTime: {filtro_data}")
-    logging.info(f"Filtro Outlook - Subject: {filtro_assunto}")
-    logging.info(f"Filtro Outlook - COMBINADO: {filtro_combinado}")
+    # 2) Monta filtros OR por igualdade de Subject
+    def escape_quotes(s: str) -> str:
+        return s.replace("'", "''")  # escape padrão para DASL
 
-    # 4) Restrict
+    clauses = [f"[Subject] = '{escape_quotes(s)}'" for s in expected_subjects]
+
+    # 3) Para evitar limites de tamanho do filtro, vamos em "chunks"
+    CHUNK_SIZE = 25  # ajuste se precisar
+    candidates_map = {}  # EntryID -> mail
+
     try:
         items.Sort("[ReceivedTime]", True)
     except Exception:
         pass
-    try:
-        restricted = items.Restrict(filtro_combinado)
-        # Força materializar em lista para poder contar
-        candidates = list(restricted)
-    except Exception as e:
-        print(f"[Restrict ERROR] {e}")
-        logging.warning(f"Restrict error: {e}")
-        candidates = []
 
-    print(f">>> Emails após Restrict (combinação): {len(candidates)}")
-    logging.info(f"Emails após Restrict (combinação): {len(candidates)}")
+    for start in range(0, len(clauses), CHUNK_SIZE):
+        chunk = clauses[start:start+CHUNK_SIZE]
+        filtro_or = " OR ".join(f"({c})" for c in chunk)
+        print(f">>> Filtro Outlook - Subject (chunk {start//CHUNK_SIZE+1}): {filtro_or}")
+        logging.info(f"Filtro Outlook - Subject (chunk {start//CHUNK_SIZE+1}): {filtro_or}")
 
-    # 5) Validação final por remetente e por assunto (startswith + data no assunto no intervalo)
+        try:
+            restricted = items.Restrict(filtro_or)
+            chunk_list = list(restricted)
+        except Exception as e:
+            print(f"[Restrict ERROR - chunk {start//CHUNK_SIZE+1}] {e}")
+            logging.warning(f"Restrict error (chunk {start//CHUNK_SIZE+1}): {e}")
+            chunk_list = []
+
+        print(f">>> Emails após Restrict (chunk {start//CHUNK_SIZE+1}): {len(chunk_list)}")
+        logging.info(f"Emails após Restrict (chunk {start//CHUNK_SIZE+1}): {len(chunk_list)}")
+
+        for m in chunk_list:
+            try:
+                entry_id = str(getattr(m, "EntryID", "") or "")
+                if entry_id and entry_id not in candidates_map:
+                    candidates_map[entry_id] = m
+            except Exception:
+                pass
+
+    candidates = list(candidates_map.values())
+    print(f">>> Total único após somar todos os chunks: {len(candidates)}")
+    logging.info(f"Total único após somar todos os chunks: {len(candidates)}")
+
+    # 4) Validação final por remetente e por assunto (prefixo + data no intervalo)
     out = []
     for mail in candidates:
         try:
@@ -192,7 +212,6 @@ def restrict_by_date_and_subject(items, data_inicio_dt: dt.datetime, data_fim_dt
             if not subj.startswith(ASSUNTO_FIXO):
                 continue
 
-            # extrai a data do assunto
             data_str = subj.replace(ASSUNTO_FIXO, "").strip()
             try:
                 data_no_assunto = dt.datetime.strptime(data_str, "%d/%m/%Y")
@@ -206,7 +225,6 @@ def restrict_by_date_and_subject(items, data_inicio_dt: dt.datetime, data_fim_dt
 
     print(f">>> Emails após validar remetente/assunto: {len(out)}")
     logging.info(f"Emails após validar remetente/assunto: {len(out)}")
-    # lista os assuntos para conferência
     for m in out:
         try:
             print("   -", str(getattr(m, "Subject", "") or ""))
@@ -483,7 +501,6 @@ def main():
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
     folder = open_outlook_folder_by_path(OUTLOOK_FOLDER_PATH)
     items = folder.Items
-    # sort redundante; dentro da restrict já tento de novo
     try:
         items.Sort("[ReceivedTime]", True)
     except Exception:
@@ -675,7 +692,7 @@ def main():
     except Exception as e:
         logging.warning(f"Falha ao salvar saída: {e}")
 
-    logging.info("Processo concluído (v2.5).")
+    logging.info("Processo concluído (v2.6).")
 
 # =========================
 # RUN
