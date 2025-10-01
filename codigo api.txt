@@ -43,7 +43,6 @@ HTTP_TIMEOUT = 45
 LOG_LEVEL = logging.INFO
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 
-
 # =========================
 # HELPERS
 # =========================
@@ -119,7 +118,6 @@ def state_add_triplet(state: Dict, orgao: str, tipo: str, nnum: str) -> None:
     if key not in arr:
         arr.append(key)
 
-
 # =========================
 # ALIASES & ACRÔNIMOS
 # =========================
@@ -158,7 +156,6 @@ def org_match_loose(email_org: str, meta_org: str) -> bool:
 def tipo_main_token(tipo: str) -> str:
     t = N(tipo)
     return re.split(r"[^\w]+", t)[0] if t else ""
-
 
 # =========================
 # OUTLOOK
@@ -214,9 +211,8 @@ def restrict_by_date_and_subject(items, data_inicio_dt: dt.datetime, data_fim_dt
             continue
     return out
 
-
 # =========================
-# EMAIL HTML -> DATAFRAME CANÔNICO
+# EMAIL HTML -> DATAFRAME
 # =========================
 COLS_CANON = ["Tipo", "Número", "Data do Ato", "Órgão", "Ementa", "Vigência"]
 
@@ -230,10 +226,13 @@ HEADER_VARIANTS = {
     "Vigência": {N("Vigência"), N("Vigencia")},
 }
 
+# ATENÇÃO: agora NÃO cortamos o HTML por "forward markers".
 FORWARD_MARKERS = re.compile(
     r"(mensagem encaminhada|encaminhada|enc:|fw:|forwarded message|-----+ original message -----+)",
     re.I
 )
+
+BAD_TIPO_PREFIXES = {N("Prezados"), N("Prezados Senhores"), N("Prezado")}
 
 def _row_cells(tr) -> list[str]:
     tds = tr.find_all(["td", "th"])
@@ -269,17 +268,9 @@ def _scan_table_for_header(table) -> Optional[Tuple[Dict[int, str], int, list]]:
     _, mapping, idx, trs = best
     return mapping, idx, trs
 
-def extract_df_from_email_html(html: str) -> pd.DataFrame:
-    if not html:
-        return pd.DataFrame(columns=COLS_CANON)
-
-    cut_html = html
-    m = FORWARD_MARKERS.search(html)
-    if m:
-        cut_html = html[:m.start()]
-
-    soup = BeautifulSoup(cut_html, "lxml")
-    candidates: list[tuple[Tuple[int, int], pd.DataFrame]] = []
+def _bs4_extract(html: str) -> pd.DataFrame:
+    soup = BeautifulSoup(html, "lxml")
+    candidates: list[pd.DataFrame] = []
 
     for table in soup.find_all("table"):
         header_scan = _scan_table_for_header(table)
@@ -296,8 +287,12 @@ def extract_df_from_email_html(html: str) -> pd.DataFrame:
             for i, canon in idx_to_key.items():
                 if i < len(cells):
                     row[canon] = cells[i]
-            if only_digits(row.get("Número", "")):
-                records.append(row)
+            # filtro básico
+            if not only_digits(row.get("Número", "")):
+                continue
+            if N(row.get("Tipo","")) in BAD_TIPO_PREFIXES:
+                continue
+            records.append(row)
 
         if not records:
             continue
@@ -306,20 +301,84 @@ def extract_df_from_email_html(html: str) -> pd.DataFrame:
         for c in COLS_CANON:
             df_tmp[c] = df_tmp[c].fillna("").astype(str).str.replace("\xa0", " ", regex=False).str.strip()
 
-        mask_headerish = df_tmp["Número"].map(lambda x: N(x) in HEADER_VARIANTS["Número"])
-        df_tmp = df_tmp[~mask_headerish].copy()
-
-        # Mantemos todas as linhas (mesmo Número pode existir para órgãos/tipos diferentes)
-        useful_cols = sum(df_tmp[c].notna().any() for c in ["Tipo","Número","Data do Ato","Órgão"])
-        score = (useful_cols, len(df_tmp))
-        candidates.append((score, df_tmp))
+        candidates.append(df_tmp)
 
     if not candidates:
         return pd.DataFrame(columns=COLS_CANON)
 
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    best_df = candidates[0][1].copy()
-    return best_df[COLS_CANON].reset_index(drop=True)
+    # escolhe a com mais linhas válidas (Número + Tipo + Órgão)
+    def _valid_rows(df):
+        return (df["Número"].map(only_digits).str.len() > 0) & (df["Tipo"].str.strip() != "") & (df["Órgão"].str.strip() != "")
+
+    candidates.sort(key=lambda d: _valid_rows(d).sum(), reverse=True)
+    return candidates[0].reset_index(drop=True)
+
+def _pandas_read_html_extract(html: str) -> pd.DataFrame:
+    """Fallback usando pandas.read_html, com mapeamento de cabeçalhos."""
+    try:
+        dfs = pd.read_html(html)
+    except ValueError:
+        return pd.DataFrame(columns=COLS_CANON)
+    cands = []
+    for df in dfs:
+        # flattens MultiIndex columns se existir
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [" ".join([str(x) for x in tup if x and x==x]).strip() for tup in df.columns.values]
+        # normaliza headers
+        colmap = {}
+        for col in df.columns:
+            cn = N(str(col))
+            mapped = None
+            for canon, variants in HEADER_VARIANTS.items():
+                if cn in variants:
+                    mapped = canon
+                    break
+            if mapped:
+                colmap[col] = mapped
+        if not colmap:
+            continue
+        df2 = df.rename(columns=colmap)
+        # mantém apenas colunas reconhecidas
+        keep = [c for c in df2.columns if c in COLS_CANON]
+        if not keep:
+            continue
+        df2 = df2[keep].copy()
+        # normaliza e filtra
+        for c in keep:
+            df2[c] = df2[c].astype(str).fillna("").str.replace("\xa0"," ", regex=False).str.strip()
+        if "Número" not in df2.columns:
+            continue
+        df2 = df2[df2["Número"].map(only_digits).str.len() > 0]
+        if "Tipo" in df2.columns:
+            df2 = df2[~df2["Tipo"].map(lambda x: N(x) in BAD_TIPO_PREFIXES)]
+        # exige ao menos 3 colunas chave
+        required = sum(int(c in df2.columns) for c in ["Tipo","Número","Órgão","Data do Ato"])
+        if required >= 3 and not df2.empty:
+            # adiciona colunas faltantes vazias para padronizar
+            for c in COLS_CANON:
+                if c not in df2.columns:
+                    df2[c] = ""
+            cands.append(df2[COLS_CANON].copy())
+
+    if not cands:
+        return pd.DataFrame(columns=COLS_CANON)
+
+    cands.sort(key=lambda d: len(d), reverse=True)
+    return cands[0].reset_index(drop=True)
+
+def extract_df_from_email_html(html: str) -> pd.DataFrame:
+    """Tenta BS4 com e sem 'forward cut'; se falhar, usa pandas.read_html."""
+    if not html:
+        return pd.DataFrame(columns=COLS_CANON)
+
+    # 1) Tenta BS4 no HTML completo (NÃO corta mais por 'FORWARD_MARKERS')
+    df = _bs4_extract(html)
+    if not df.empty:
+        return df
+
+    # 2) Tenta fallback pandas.read_html
+    df = _pandas_read_html_extract(html)
+    return df if not df.empty else pd.DataFrame(columns=COLS_CANON)
 
 def add_normalized_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -329,14 +388,12 @@ def add_normalized_cols(df: pd.DataFrame) -> pd.DataFrame:
     out["DATA_ATO_DT"] = out["Data do Ato"].map(parse_date_flexible)
     return out
 
-
 # =========================
 # METAS (EXCEL)
 # =========================
 def load_metas_df(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, dtype=str).fillna("")
-    # DEBUG opcional:
-    # print("\n--- Preview METAS (bruto) ---"); print(df.head(10))
+    # print("\n--- Preview METAS (bruto) ---"); print(df.head(10))  # DEBUG OPCIONAL
 
     expected_cols = ["Órgão regulador", "Tipo", "Número"]
     for col in expected_cols:
@@ -359,11 +416,8 @@ def load_metas_df(path: str) -> pd.DataFrame:
     metas["PDF"] = ""      # será preenchido com 'SIM'
     metas["Caminho"] = ""  # caminho do arquivo salvo
 
-    # DEBUG opcional:
-    # print("\n--- Preview METAS (normalizado) ---"); print(metas.head(10))
-
+    # print("\n--- Preview METAS (normalizado) ---"); print(metas.head(10))  # DEBUG OPCIONAL
     return metas
-
 
 # =========================
 # MATCHING
@@ -375,7 +429,6 @@ def row_matches_target(email_row: pd.Series, meta_row: pd.Series) -> bool:
         return False
     e_tok, t_tok = tipo_main_token(email_row["N_TIPO"]), tipo_main_token(meta_row["N_TIPO"])
     return (t_tok == e_tok) or (t_tok and t_tok in email_row["N_TIPO"]) or (e_tok and e_tok in meta_row["N_TIPO"])
-
 
 # =========================
 # PDF DOWNLOAD
@@ -434,7 +487,6 @@ def download_link(url: str, dest_path: str) -> bool:
         logging.warning(f"Falha no download {url}: {e}")
         return False
 
-
 # =========================
 # PIPELINE
 # =========================
@@ -468,10 +520,11 @@ def main():
             continue
 
         df_email = add_normalized_cols(df_email)
-        # Garante que os campos de e-mail existam:
         df_email["EMAIL_ENTRY_ID"]  = entry_id
         df_email["EMAIL_SUBJECT"]   = subj
         df_email["EMAIL_RECEIVED"]  = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
+
+        # print("\n--- Preview EMAIL extraído ---"); print(df_email.head(20))  # DEBUG OPCIONAL
 
         email_dfs.append(df_email)
         email_df_map[entry_id] = df_email.copy()
@@ -485,20 +538,14 @@ def main():
         return
 
     emails_df_inmem = pd.concat(email_dfs, ignore_index=True)
-    # DEBUG opcional:
-    # print("\n--- Preview EMAILS (normalizado) ---"); print(emails_df_inmem.head(20))
 
     # 2) Metas (fonte da verdade)
     metas_df = load_metas_df(ARQUIVO_EXCEL_METAS)
-    # DEBUG opcional:
-    # print("\n--- Preview METAS (normalizado) ---"); print(metas_df.head(20))
 
-    # 3) MATCH por número com validações auxiliares
+    # 3) MATCH por número + validações auxiliares
     base_join = emails_df_inmem.merge(
         metas_df, how="inner", left_on="N_NUM", right_on="N_NUM", suffixes=("_EMAIL", "_META")
     )
-
-    # Se por algum motivo as colunas de e-mail se sobrepuserem, garantimos que existam:
     for col in ["EMAIL_ENTRY_ID", "EMAIL_SUBJECT", "EMAIL_RECEIVED"]:
         if col not in base_join.columns and f"{col}_EMAIL" in base_join.columns:
             base_join[col] = base_join[f"{col}_EMAIL"]
@@ -526,7 +573,7 @@ def main():
         try:
             iter_df = iter_df.sort_values("EMAIL_RECEIVED")
         except Exception:
-            pass  # se a coluna estiver com formato estranho, segue sem ordenar
+            pass
 
     for _, r in iter_df.iterrows():
         entry_id = r.get("EMAIL_ENTRY_ID", "")
@@ -546,7 +593,12 @@ def main():
         base_name = build_output_name_orgao_tipo_num(orgao, tipo, numero_vis)
         fs_hit = None
         try:
-            fs_hit = file_already_present(PASTA_DESTINO, base_name)
+            # verifica se já existe algum arquivo começando com esse nome
+            stem = os.path.splitext(base_name)[0].lower()
+            for f in os.listdir(PASTA_DESTINO):
+                if f.lower().endswith(".pdf") and f.lower().startswith(stem):
+                    fs_hit = os.path.join(PASTA_DESTINO, f)
+                    break
         except Exception:
             fs_hit = None
 
@@ -625,8 +677,8 @@ def main():
             "status": "BAIXADO" if saved_paths else "NAO_ENCONTRADO_PDF"
         })
 
-    # 5) Atualiza METAS com PDF/Caminho
-    metas_df = load_metas_df(ARQUIVO_EXCEL_METAS)  # recarrega limpo para escrever o final
+    # 5) Atualiza METAS com PDF/Caminho e gera apenas o Excel final
+    metas_df = load_metas_df(ARQUIVO_EXCEL_METAS)  # recarrega
     if results:
         df_results = pd.DataFrame(results)
         metas_df["__KEY__"] = metas_df.apply(lambda r: triplet_key(r["Órgão"], r["Tipo"], r["N_NUM"]), axis=1)
@@ -640,7 +692,7 @@ def main():
 
         metas_df.drop(columns=["__KEY__"], inplace=True, errors="ignore")
 
-    # 6) Log CSV (permanece; apenas não geramos outros Excel)
+    # LOG CSV (opcional manter)
     try:
         if results:
             df_log = pd.DataFrame(results)
@@ -656,7 +708,6 @@ def main():
 
     save_state(state)
 
-    # 7) Gera APENAS o Excel final (metas + PDF + Caminho)
     try:
         metas_df[["Órgão","Tipo","Número","PDF","Caminho"]].to_excel(EXCEL_FINAL, index=False)
         logging.info(f"Planilha final gerada: {EXCEL_FINAL}")
