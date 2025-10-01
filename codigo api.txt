@@ -117,6 +117,50 @@ def file_already_present(dest_dir: str, base_filename: str) -> Optional[str]:
     return None
 
 # =========================
+# ALIASES & ACRÔNIMOS (no-ops de quem ainda não casava: BNDES, MCID)
+# =========================
+ALIASES_ORGAO_RAW = {
+    "BANCO NACIONAL DE DESENVOLVIMENTO ECONOMICO E SOCIAL": ["BNDES"],
+    "MINISTERIO DAS CIDADES": ["MCID", "MINISTERIO DA CIDADE"],
+    "MINISTERIO DA FAZENDA": ["MF", "FAZENDA"],
+    "MINISTERIO DA ECONOMIA": ["ME", "ECONOMIA"],
+    "BANCO CENTRAL DO BRASIL": ["BCB", "BACEN", "BANCO CENTRAL"],
+    "CONSELHO MONETARIO NACIONAL": ["CMN"]
+}
+# normaliza keys e valores
+ALIASES_ORGAO = {N(k): [N(v) for v in vs] for k, vs in ALIASES_ORGAO_RAW.items()}
+
+STOPWORDS_SIGLA = {"DE","DA","DO","DAS","DOS","E","DOU","DOU-SE"}
+
+def acronym_norm(s: str) -> str:
+    toks = [t for t in re.split(r"[^\w]+", N(s)) if t and t not in STOPWORDS_SIGLA]
+    return "".join(t[0] for t in toks)[:8]
+
+def org_aliases(org: str) -> List[str]:
+    orgN = N(org)
+    out = {orgN, acronym_norm(orgN)}
+    # pega aliases cadastrados
+    for key, vals in ALIASES_ORGAO.items():
+        if key in orgN or orgN in key:
+            out.add(key)
+            out.update(vals)
+    return [a for a in out if a]
+
+def org_match_loose(email_org: str, meta_org: str) -> bool:
+    e, m = N(email_org), N(meta_org)
+    if m in e or e in m:
+        return True
+    al = set(org_aliases(meta_org))
+    # também tenta o acrônimo do email vs meta
+    al.add(acronym_norm(email_org))
+    return any(a and a in e for a in al)
+
+def tipo_main_token(tipo: str) -> str:
+    t = N(tipo)
+    # primeira palavra útil
+    return re.split(r"[^\w]+", t)[0] if t else ""
+
+# =========================
 # OUTLOOK
 # =========================
 def open_outlook_folder_by_path(path_str: str):
@@ -319,48 +363,35 @@ def load_metas_df(path: str) -> pd.DataFrame:
 # MATCHING
 # =========================
 def row_matches_target(email_row: pd.Series, meta_row: pd.Series) -> bool:
+    # mantém o match forte por número
     if str(email_row["N_NUM"]) != str(meta_row["N_NUM"]):
         return False
-    e_org = email_row["N_ORGAO"]; t_org = meta_row["N_ORGAO"]
-    e_tipo= email_row["N_TIPO"];  t_tipo= meta_row["N_TIPO"]
-    org_ok = any(alias in e_org for alias in [t_org, "BANCO CENTRAL", "BANCO CENTRAL DO BRASIL", "BCB", "BACEN", "CVM", "ANBIMA", "CMN"])
-    if not org_ok:
+    # órgão com aliases/acrônimo e contenções
+    if not org_match_loose(email_row["N_ORGAO"], meta_row["N_ORGAO"]):
         return False
-    tipo_ok = (t_tipo in e_tipo) or (e_tipo in t_tipo) or (t_tipo.split()[0] in e_tipo if t_tipo else False)
-    return tipo_ok
+    # tipo por token principal
+    e_tok, t_tok = tipo_main_token(email_row["N_TIPO"]), tipo_main_token(meta_row["N_TIPO"])
+    return (t_tok == e_tok) or (t_tok and t_tok in email_row["N_TIPO"]) or (e_tok and e_tok in meta_row["N_TIPO"])
 
 # =========================
-# PDF DOWNLOAD (anexos escolhidos com base nas METAS)
+# PDF DOWNLOAD (escolha por score; fallback sem número)
 # =========================
-ALIASES_ORGAO = {
-    "BANCO CENTRAL DO BRASIL": ["BANCO CENTRAL", "BCB", "BACEN"],
-    "CVM": ["CVM"],
-    "ANBIMA": ["ANBIMA"],
-    "CMN": ["CMN", "CONSELHO MONETÁRIO NACIONAL", "CONSELHO MONETARIO NACIONAL"]
-}
-
-def score_attachment_for_meta(filename: str, orgao: str, tipo: str, nnum: str) -> int:
-    """Score alto = melhor candidato para a meta."""
+def score_attachment_for_meta(filename: str, orgao: str, tipo: str, nnum: str, require_number: bool) -> Optional[int]:
     nameN = N(filename)
+    has_num = nnum in nameN if nnum else False
+    if require_number and not has_num:
+        return None
     score = 0
-    if nnum in nameN:
+    if has_num:
         score += 100
-    first_tipo = N(tipo).split()[0] if tipo else ""
+    first_tipo = tipo_main_token(tipo)
     if first_tipo and first_tipo in nameN:
         score += 20
-    # aliases do órgão
-    org_key = N(orgao)
-    aliases = set([org_key])
-    for k, arr in ALIASES_ORGAO.items():
-        if N(k) in org_key:
-            aliases.update([N(a) for a in arr])
-            break
-    for a in aliases:
-        if a and a in nameN:
+    for alias in org_aliases(orgao):
+        if alias and alias in nameN:
             score += 10
-    # bônus se bater com prefixo esperado:
-    prefix = N(os.path.splitext(build_output_name_orgao_tipo_num(orgao, tipo, nnum))[0])
-    if prefix.split("_")[-1] in nameN:  # pelo menos o número final
+    # bônus se o "prefixo" esperado aparecer (ao menos o número)
+    if nnum and nnum in nameN:
         score += 5
     return score
 
@@ -407,8 +438,7 @@ def main():
     ensure_dir(PASTA_DESTINO)
     state = load_state()
 
-    # 1) Ler e-mails e consolidar tabela (gera Excel de auditoria)
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    # 1) Ler e-mails e consolidar (gera Excel de auditoria) + guardar DF por e-mail
     folder = open_outlook_folder_by_path(OUTLOOK_FOLDER_PATH)
     items = folder.Items
     items.Sort("[ReceivedTime]", True)
@@ -420,6 +450,7 @@ def main():
 
     email_dfs: List[pd.DataFrame] = []
     mail_index: Dict[str, object] = {}
+    email_df_map: Dict[str, pd.DataFrame] = {}
 
     for mail in mails:
         entry_id = str(getattr(mail, "EntryID", ""))
@@ -440,6 +471,7 @@ def main():
         df_email["EMAIL_RECEIVED"] = recd.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recd, dt.datetime) else ""
 
         email_dfs.append(df_email)
+        email_df_map[entry_id] = df_email.copy()
         mail_index[entry_id] = mail
 
     if not email_dfs:
@@ -453,29 +485,21 @@ def main():
     except Exception as e:
         logging.warning(f"Falha ao salvar Excel consolidado: {e}")
 
-    # 2) Reabre a planilha do e-mail (fonte para JOIN)
+    # 2) Reabre planilha do e-mail (fonte para JOIN)
     emails_df = pd.read_excel(ARQUIVO_EXCEL_EMAILS, dtype=str).fillna("")
     emails_df["N_TIPO"]   = emails_df["Tipo"].map(N)
     emails_df["N_NUM"]    = emails_df["Número"].map(only_digits)
     emails_df["N_ORGAO"]  = emails_df["Órgão"].map(N)
 
-    # 3) Metas (fonte de verdade para confronto de anexos)
+    # 3) Metas (fonte da verdade)
     metas_df = load_metas_df(ARQUIVO_EXCEL_METAS)
     logging.info(f"Metas carregadas: {len(metas_df)}")
 
-    # 4) JOIN por N_NUM
+    # 4) JOIN forte por número
     base_join = emails_df.merge(
-        metas_df,
-        how="inner",
-        left_on="N_NUM",
-        right_on="N_NUM",
-        suffixes=("_EMAIL", "_META")
+        metas_df, how="inner", left_on="N_NUM", right_on="N_NUM", suffixes=("_EMAIL", "_META")
     )
-    if base_join.empty:
-        logging.info("Nenhum número coincidente entre e-mails e metas.")
-        return
-
-    # 5) validação órgão/tipo
+    # validação órgão/tipo
     ok_mask = []
     for _, row in base_join.iterrows():
         ok_mask.append(
@@ -489,14 +513,66 @@ def main():
             )
         )
     matched = base_join[ok_mask].copy()
+
+    # Conjunto de triplas já atendidas
+    done_keys = set(
+        f"{N(r['Órgão_META'])}|{N(r['Tipo_META'])}|{str(r['N_NUM'])}"
+        for _, r in matched.iterrows()
+    )
+
+    # 5) Fallback: metas não atendidas — tentar casar por (Órgão ~ aliases/acrônimo) + tipo (token principal)
+    remaining_metas = []
+    for _, m in metas_df.iterrows():
+        key = f"{m['N_ORGAO']}|{m['N_TIPO']}|{str(m['N_NUM'])}"
+        if key not in done_keys:
+            remaining_metas.append(m)
+    fallback_rows = []
+
+    for entry_id, df_email in email_df_map.items():
+        for m in remaining_metas:
+            # procura linha do e-mail que combine por órgão (aliases/acrônimo) + tipo (main token)
+            main_tok = tipo_main_token(m["N_TIPO"])
+            candidates = df_email[
+                df_email.apply(lambda r: org_match_loose(r["N_ORGAO"], m["N_ORGAO"]) and
+                                         (main_tok and (main_tok in r["N_TIPO"] or main_tok == tipo_main_token(r["N_TIPO"]))),
+                               axis=1)
+            ]
+            if not candidates.empty:
+                # pegue a primeira linha (qualquer uma já garante presença)
+                r = candidates.iloc[0]
+                row = {
+                    "EMAIL_ENTRY_ID": entry_id,
+                    "EMAIL_SUBJECT": r["EMAIL_SUBJECT"],
+                    "EMAIL_RECEIVED": r["EMAIL_RECEIVED"],
+                    "Órgão_META": m["Órgão"],
+                    "Tipo_META": m["Tipo"],
+                    "Número_META": m["Número"],
+                    "N_ORGAO_META": m["N_ORGAO"],
+                    "N_TIPO_META": m["N_TIPO"],
+                    "N_NUM": m["N_NUM"],  # pode estar vazio/estranho; usaremos só se ajudar
+                }
+                fallback_rows.append(row)
+
+    matched_fallback = pd.DataFrame(fallback_rows)
+    # Unifica (mantendo os já fortes)
+    if not matched_fallback.empty:
+        # Remove os que já estão em 'matched'
+        mf_keys = set(f"{N(r['Órgão_META'])}|{N(r['Tipo_META'])}|{str(r['N_NUM'])}" for _, r in matched.iterrows())
+        matched_fallback = matched_fallback[
+            matched_fallback.apply(lambda r: f"{N(r['Órgão_META'])}|{N(r['Tipo_META'])}|{str(r['N_NUM'])}" not in mf_keys, axis=1)
+        ]
+        # Anexa como se fosse o mesmo schema de 'matched'
+        matched_extra = matched_fallback.copy()
+        matched_extra["EMAIL_ENTRY_ID"] = matched_fallback["EMAIL_ENTRY_ID"]
+        matched = pd.concat([matched, matched_extra], ignore_index=True)
+
     if matched.empty:
-        logging.info("Nenhum match validado por órgão/tipo.")
+        logging.info("Nenhum match encontrado.")
         return
 
-    logging.info(f"Matches validados: {len(matched)}")
+    logging.info(f"Total de matches (forte + fallback): {len(matched)}")
 
-    # 6) PARA CADA E-MAIL, ESCOLHER ANEXOS USANDO *APENAS* AS LINHAS DA PLANILHA DE METAS
-    #    (que foram validadas no match)
+    # 6) Download por e-mail, usando metas como referência
     saved_mail_num = set()
     results = []
 
@@ -504,47 +580,44 @@ def main():
         mail = mail_index.get(entry_id)
         if mail is None:
             continue
-
-        # anexa uma única vez a lista completa de anexos .pdf do e-mail
         all_atts = find_all_pdf_attachments(mail)
 
         for _, r in grp.iterrows():
-            nnum   = str(r["N_NUM"])
+            nnum   = str(r.get("N_NUM") or "")
             orgao  = str(r.get("Órgão_META") or "")
             tipo   = str(r.get("Tipo_META")  or "")
             numero_vis = str(r.get("Número_META") or nnum)
 
-            # trava por (email, numero) no mesmo run
-            key_mail_num = (entry_id, nnum)
+            # trava por (email, numero) quando há número. Se não houver, trava por (email, orgao|tipo)
+            key_mail_num = (entry_id, nnum if nnum else f"{N(orgao)}|{tipo_main_token(tipo)}")
             if key_mail_num in saved_mail_num:
                 continue
 
-            # persistência e filesystem
             base_name = build_output_name_orgao_tipo_num(orgao, tipo, numero_vis)
             fs_hit = file_already_present(PASTA_DESTINO, base_name)
             if state_has_triplet(state, orgao, tipo, nnum) or fs_hit:
                 saved_mail_num.add(key_mail_num)
                 results.append({
                     "email_entry_id": entry_id,
-                    "email_subject": r["EMAIL_SUBJECT"],
-                    "email_received": r.get("EMAIL_RECEIVED", ""),
+                    "email_subject": r.get("EMAIL_SUBJECT",""),
+                    "email_received": r.get("EMAIL_RECEIVED",""),
                     "orgao": orgao, "tipo": tipo, "numero": nnum,
                     "arquivos_salvos": fs_hit or "",
                     "status": "JA_EXISTIA"
                 })
                 continue
 
-            # escolhe o MELHOR anexo por score (usando *metas* como referência)
+            # 1º: tenta com número obrigatório
             scored = []
             for name, att in all_atts:
-                if nnum not in N(name):  # número é requisito
-                    continue
-                scored.append((score_attachment_for_meta(name, orgao, tipo, nnum), name, att))
+                sc = score_attachment_for_meta(name, orgao, tipo, nnum, require_number=True)
+                if sc is not None:
+                    scored.append((sc, name, att))
             scored.sort(reverse=True)
 
             saved_paths = []
             if scored:
-                _, name, att = scored[0]  # pega só o melhor
+                _, name, att = scored[0]
                 dest = os.path.join(PASTA_DESTINO, base_name)
                 k = 1
                 while os.path.exists(dest):
@@ -552,19 +625,35 @@ def main():
                     k += 1
                 att.SaveAsFile(dest)
                 saved_paths.append(dest)
-
-            # fallback: link com o número
-            if not saved_paths:
-                html = str(getattr(mail, "HTMLBody", "") or "")
-                for url in find_pdf_links_in_html(html, nnum):
+            else:
+                # 2º: fallback sem número (para casos como “Portaria Inter MCID_MF 2025-04.pdf”)
+                scored2 = []
+                for name, att in all_atts:
+                    sc = score_attachment_for_meta(name, orgao, tipo, nnum, require_number=False)
+                    if sc is not None:
+                        scored2.append((sc, name, att))
+                scored2.sort(reverse=True)
+                if scored2:
+                    _, name, att = scored2[0]
                     dest = os.path.join(PASTA_DESTINO, base_name)
                     k = 1
                     while os.path.exists(dest):
                         dest = os.path.join(PASTA_DESTINO, sanitize_filename(os.path.splitext(base_name)[0] + f"_{k}.pdf"))
                         k += 1
-                    if download_link(url, dest):
-                        saved_paths.append(dest)
-                        break  # só um arquivo
+                    att.SaveAsFile(dest)
+                    saved_paths.append(dest)
+                else:
+                    # último recurso: link com número (se houver)
+                    html = str(getattr(mail, "HTMLBody", "") or "")
+                    for url in find_pdf_links_in_html(html, nnum):
+                        dest = os.path.join(PASTA_DESTINO, base_name)
+                        k = 1
+                        while os.path.exists(dest):
+                            dest = os.path.join(PASTA_DESTINO, sanitize_filename(os.path.splitext(base_name)[0] + f"_{k}.pdf"))
+                            k += 1
+                        if download_link(url, dest):
+                            saved_paths.append(dest)
+                            break
 
             saved_mail_num.add(key_mail_num)
             if saved_paths:
@@ -572,8 +661,8 @@ def main():
 
             results.append({
                 "email_entry_id": entry_id,
-                "email_subject": r["EMAIL_SUBJECT"],
-                "email_received": r.get("EMAIL_RECEIVED", ""),
+                "email_subject": r.get("EMAIL_SUBJECT",""),
+                "email_received": r.get("EMAIL_RECEIVED",""),
                 "orgao": orgao, "tipo": tipo, "numero": nnum,
                 "arquivos_salvos": ";".join(saved_paths),
                 "status": "BAIXADO" if saved_paths else "NAO_ENCONTRADO_PDF"
